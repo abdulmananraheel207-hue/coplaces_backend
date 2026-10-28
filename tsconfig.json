@@ -12,5 +12,5 @@
     "rootDir": ".",
     "types": ["node"]
   },
-  "include": ["src", "test", "server.ts", "drizzle.config.ts"]
+  "include": ["src", "test", "scripts", "server.ts", "drizzle.config.ts"]
 }

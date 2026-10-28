@@ -15,8 +15,10 @@ import { authRouter } from './routes/auth.js';
 import { announcementsRouter } from './routes/announcements.js';
 import { bookingsRouter } from './routes/bookings.js';
 import { contractsRouter } from './routes/contracts.js';
+import { devicesRouter } from './routes/devices.js';
 import { expensesRouter } from './routes/expenses.js';
 import { floorPlanRouter } from './routes/floorplan.js';
+import { iclockRouter } from './routes/iclock.js';
 import { invoicesRouter } from './routes/invoices.js';
 import { locationsRouter } from './routes/locations.js';
 import { meRouter } from './routes/me.js';
@@ -72,6 +74,8 @@ export function createApp(db: Db, opts: { webDist?: string } = {}) {
       },
     }),
   );
+  // Attendance devices speak plain text, before the JSON parser, and cannot sign in.
+  app.use('/iclock', iclockRouter(db));
   app.use(express.json({ limit: '100kb' }));
   app.use(cookieParser());
 
@@ -115,6 +119,7 @@ export function createApp(db: Db, opts: { webDist?: string } = {}) {
   api.use('/assets', assetsRouter(db));
   api.use('/issues', issuesRouter(db));
   api.use('/attendance', attendanceRouter(db));
+  api.use('/devices', devicesRouter(db));
   api.use('/visitors', requireFeature('visitors'), visitorsRouter(db));
   api.use('/invoices', requireFeature('invoicing'), invoicesRouter(db));
   api.use('/payments', requireFeature('invoicing'), paymentsRouter(db));

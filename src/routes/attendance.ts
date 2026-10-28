@@ -2,9 +2,9 @@ import { Router } from 'express';
 import { and, desc, eq, gte, inArray, isNull, lt, lte, ne, or } from 'drizzle-orm';
 import { z } from 'zod';
 import type { Db } from '../db/client.js';
-import { attendance, bookings, members, resourceAssignments, resources, users } from '../db/schema.js';
+import { attendance, bookings, members, resourceAssignments, resources, staffAttendance, users } from '../db/schema.js';
 import { assertMemberAccess, loadLocation, loadMember, requireLocationId } from '../lib/access.js';
-import { assertLocation, isStaff, staffOnly } from '../lib/auth.js';
+import { assertLocation, isStaff, managerUp, staffOnly } from '../lib/auth.js';
 import { assertCan } from '../lib/permissions.js';
 import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
 import { idParam, queryString } from '../lib/http.js';
@@ -67,6 +67,23 @@ export function attendanceRouter(db: Db) {
     const out = await db.update(attendance).set({ checkOutAt: new Date().toISOString() }).where(eq(attendance.id, row.id)).returning().get();
     await finishBookingOnCheckOut(db, row);
     res.json(out);
+  });
+
+  // The team's clock-ins from attendance devices on a day. One left open from an earlier day is a missed clock-out.
+  r.get('/staff', managerUp, async (req, res) => {
+    const locationId = requireLocationId(req);
+    const loc = await loadLocation(db, locationId);
+    const date = queryString(req, 'date') ?? todayIn(loc.timezone);
+    if (!isValidDate(date)) throw badRequest('date must be YYYY-MM-DD');
+    const range = dayRange(date, loc.timezone);
+    const rows = await db
+      .select({ a: staffAttendance, name: users.name, role: users.role })
+      .from(staffAttendance)
+      .innerJoin(users, eq(users.id, staffAttendance.userId))
+      .where(and(eq(staffAttendance.locationId, locationId), gte(staffAttendance.checkInAt, range.start), lt(staffAttendance.checkInAt, range.end)))
+      .orderBy(desc(staffAttendance.checkInAt))
+      .all();
+    res.json(rows.map(({ a, ...rest }) => ({ ...a, ...rest, minutes: a.checkOutAt ? Math.round((Date.parse(a.checkOutAt) - Date.parse(a.checkInAt)) / 60_000) : null })));
   });
 
   // Members' own recent visits.

@@ -64,6 +64,13 @@
       "when": 1793105191606,
       "tag": "0008_long_vampiro",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1793184929205,
+      "tag": "0009_attendance_devices",
+      "breakpoints": true
     }
   ]
 }

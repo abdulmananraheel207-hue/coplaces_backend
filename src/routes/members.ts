@@ -21,6 +21,7 @@ import { requirePermission } from '../lib/permissions.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { DATE_RE, isValidDate, todayIn } from '../lib/time.js';
 import { finishBookingOnCheckOut } from '../services/checkin.js';
+import { syncUser } from '../services/devices.js';
 import { idParam } from '../lib/http.js';
 import { tempPassword } from '../lib/passwords.js';
 import { parse } from '../lib/validate.js';
@@ -70,6 +71,7 @@ export function membersRouter(db: Db) {
         name: user.name,
         email: user.email,
         phone: user.phone,
+        devicePin: user.devicePin,
         planName: plan?.name ?? null,
         checkedIn: present.has(member.id),
       })),
@@ -120,11 +122,14 @@ export function membersRouter(db: Db) {
         .returning()
         .get();
     });
+    await syncUser(db, member.userId);
+    const { devicePin } = (await db.select({ devicePin: users.devicePin }).from(users).where(eq(users.id, member.userId)).get())!;
     res.status(201).json({
       ...member,
       name: body.name,
       email: body.email,
       phone: body.phone,
+      devicePin,
       tempPassword: body.password ? undefined : password,
     });
   });
@@ -153,6 +158,7 @@ export function membersRouter(db: Db) {
       name: user.name,
       email: user.email,
       phone: user.phone,
+      devicePin: user.devicePin,
       plan,
       assignments: assigned.map(({ assignment, resource }) => ({
         ...assignment,
@@ -222,6 +228,8 @@ export function membersRouter(db: Db) {
         ? await tx.update(members).set(memberFields).where(eq(members.id, member.id)).returning().get()
         : member;
     });
+    // The devices show their name, and take them off when they leave.
+    if (name !== undefined || body.status !== undefined) await syncUser(db, user.id);
     res.json(updated);
   });
 

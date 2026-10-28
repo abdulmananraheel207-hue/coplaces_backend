@@ -12,6 +12,7 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "create-superadmin": "tsx src/db/create-superadmin.ts",
+    "device:sim": "tsx scripts/zk-sim.ts",
     "db:migrate": "tsx src/db/migrate.ts",
     "vercel-build": "npm run db:migrate"
   },

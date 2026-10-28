@@ -41,4 +41,10 @@ export const config = {
   /** Production assumes HTTPS (secure cookies, HSTS). Set ALLOW_HTTP=1 to serve over plain HTTP, e.g. a LAN install or local preview. */
   secureCookies: isProd && process.env.ALLOW_HTTP !== '1',
   webDist: process.env.WEB_DIST ?? fileURLToPath(new URL('../../web/dist', import.meta.url)),
+  /**
+   * A certificate and key (PEM files) for answering HTTPS on the same port as HTTP. Attendance devices may connect with
+   * TLS whatever their settings say, so a server they reach directly needs this. Not needed behind Vercel.
+   */
+  tlsCertFile: process.env.TLS_CERT_FILE,
+  tlsKeyFile: process.env.TLS_KEY_FILE,
 };

@@ -10,6 +10,7 @@ import { idParam } from '../lib/http.js';
 import { tempPassword } from '../lib/passwords.js';
 import { FRONT_DESK_PRESET, PERMISSIONS, PERMISSION_KEYS, resolvePermissions, sanitizePermissions } from '../lib/permissions.js';
 import { parse } from '../lib/validate.js';
+import { syncUser } from '../services/devices.js';
 
 /** Team members choose what they can do. The old two roles still work in the API as shortcuts for a set of permissions. */
 const permissionList = z.array(z.enum(PERMISSION_KEYS));
@@ -28,6 +29,7 @@ async function shape(db: Db, rows: (typeof users.$inferSelect)[]) {
     permissions: resolvePermissions(u.role, u.permissions),
     active: u.active,
     lastLoginAt: u.lastLoginAt,
+    devicePin: u.devicePin,
     locationIds: links.filter((l) => l.userId === u.id).map((l) => l.locationId),
   }));
 }
@@ -98,7 +100,9 @@ export function staffRouter(db: Db) {
       for (const locationId of new Set(body.locationIds)) await tx.insert(userLocations).values({ userId: u.id, locationId }).run();
       return u;
     });
-    res.status(201).json({ ...(await shape(db, [user]))[0], tempPassword: body.password ? undefined : password });
+    await syncUser(db, user.id);
+    const fresh = (await db.select().from(users).where(eq(users.id, user.id)).get())!;
+    res.status(201).json({ ...(await shape(db, [fresh]))[0], tempPassword: body.password ? undefined : password });
   });
 
   r.patch('/:id', async (req, res) => {
@@ -144,6 +148,7 @@ export function staffRouter(db: Db) {
       }
       return u;
     });
+    if (body.name !== undefined || body.active !== undefined || locationIds) await syncUser(db, target.id);
     res.json({ ...(await shape(db, [updated]))[0], tempPassword: temp });
   });
 

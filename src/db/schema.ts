@@ -157,21 +157,27 @@ export const locationHolidays = sqliteTable(
   (t) => [uniqueIndex('location_holidays_idx').on(t.locationId, t.date)],
 );
 
-export const users = sqliteTable('users', {
-  id: id(),
-  /** Null only for platform super admins. */
-  organizationId: text('organization_id').references(() => organizations.id),
-  email: text('email').notNull().unique(),
-  passwordHash: text('password_hash').notNull(),
-  name: text('name').notNull(),
-  phone: text('phone').notNull().default(''),
-  role: text('role', { enum: ROLES }).notNull(),
-  /** JSON list of what a team member may do (see lib/permissions.ts). Null on accounts made before permissions existed. */
-  permissions: text('permissions'),
-  active: integer('active', { mode: 'boolean' }).notNull().default(true),
-  lastLoginAt: text('last_login_at'),
-  createdAt: createdAt(),
-});
+export const users = sqliteTable(
+  'users',
+  {
+    id: id(),
+    /** Null only for platform super admins. */
+    organizationId: text('organization_id').references(() => organizations.id),
+    email: text('email').notNull().unique(),
+    passwordHash: text('password_hash').notNull(),
+    name: text('name').notNull(),
+    phone: text('phone').notNull().default(''),
+    role: text('role', { enum: ROLES }).notNull(),
+    /** JSON list of what a team member may do (see lib/permissions.ts). Null on accounts made before permissions existed. */
+    permissions: text('permissions'),
+    active: integer('active', { mode: 'boolean' }).notNull().default(true),
+    lastLoginAt: text('last_login_at'),
+    /** The user's number on the attendance devices (a ZKTeco PIN): digits only, unique within the organization. */
+    devicePin: text('device_pin'),
+    createdAt: createdAt(),
+  },
+  (t) => [uniqueIndex('users_device_pin_idx').on(t.organizationId, t.devicePin)],
+);
 
 // Which locations a manager/staff user can work in (owners implicitly have all).
 export const userLocations = sqliteTable(
@@ -367,6 +373,108 @@ export const attendance = sqliteTable(
     createdAt: createdAt(),
   },
   (t) => [index('attendance_location_idx').on(t.locationId, t.checkInAt), index('attendance_member_idx').on(t.memberId)],
+);
+
+/** A team member's own clock-in and clock-out, from an attendance device. Members' visits are in `attendance`. */
+export const staffAttendance = sqliteTable(
+  'staff_attendance',
+  {
+    id: id(),
+    locationId: text('location_id')
+      .notNull()
+      .references(() => locations.id),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id),
+    checkInAt: text('check_in_at').notNull(),
+    checkOutAt: text('check_out_at'),
+    createdAt: createdAt(),
+  },
+  (t) => [index('staff_attendance_location_idx').on(t.locationId, t.checkInAt), index('staff_attendance_user_idx').on(t.userId)],
+);
+
+// ---- Attendance devices (ZKTeco ADMS) ---------------------------------------
+
+export const DEVICE_COMMAND_STATUSES = ['pending', 'sent', 'done', 'failed'] as const;
+export const PUNCH_RESULTS = ['checked_in', 'checked_out', 'duplicate', 'ignored', 'rejected', 'unknown_pin'] as const;
+
+/** A fingerprint machine that pushes punches to us over ADMS. It is known only by its serial number. */
+export const devices = sqliteTable(
+  'devices',
+  {
+    id: id(),
+    organizationId: text('organization_id')
+      .notNull()
+      .references(() => organizations.id),
+    locationId: text('location_id')
+      .notNull()
+      .references(() => locations.id),
+    serialNumber: text('serial_number').notNull().unique(),
+    name: text('name').notNull(),
+    active: integer('active', { mode: 'boolean' }).notNull().default(true),
+    lastSeenAt: text('last_seen_at'),
+    /** What the device reports about itself (firmware, user and log counts), as it sent it. */
+    info: text('info').notNull().default(''),
+    /** How far the device has uploaded its punch log, so it does not resend everything when it restarts. */
+    attlogStamp: text('attlog_stamp'),
+    createdAt: createdAt(),
+  },
+  (t) => [index('devices_location_idx').on(t.locationId)],
+);
+
+/** Who we have put on each device, so a person who should no longer be there can be taken off. */
+export const deviceUsers = sqliteTable(
+  'device_users',
+  {
+    deviceId: text('device_id')
+      .notNull()
+      .references(() => devices.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id),
+    pin: text('pin').notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.deviceId, t.userId] })],
+);
+
+/** Commands waiting for a device. It collects them when it next polls and reports back on each by its number. */
+export const deviceCommands = sqliteTable(
+  'device_commands',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    deviceId: text('device_id')
+      .notNull()
+      .references(() => devices.id, { onDelete: 'cascade' }),
+    command: text('command').notNull(),
+    status: text('status', { enum: DEVICE_COMMAND_STATUSES }).notNull().default('pending'),
+    returnCode: integer('return_code'),
+    sentAt: text('sent_at'),
+    doneAt: text('done_at'),
+    createdAt: createdAt(),
+  },
+  (t) => [index('device_commands_device_idx').on(t.deviceId, t.status)],
+);
+
+/** Every punch a device sent, and what came of it. A device resends until we answer, so each punch is stored once. */
+export const devicePunches = sqliteTable(
+  'device_punches',
+  {
+    id: id(),
+    deviceId: text('device_id')
+      .notNull()
+      .references(() => devices.id, { onDelete: 'cascade' }),
+    pin: text('pin').notNull(),
+    /** Null when the PIN matches nobody. */
+    userId: text('user_id').references(() => users.id),
+    punchedAt: text('punched_at').notNull(),
+    /** The device's own fields: the state key pressed and how the person was verified (finger, card, password). */
+    state: integer('state'),
+    verify: integer('verify'),
+    result: text('result', { enum: PUNCH_RESULTS }).notNull(),
+    message: text('message').notNull().default(''),
+    createdAt: createdAt(),
+  },
+  (t) => [uniqueIndex('device_punches_unique_idx').on(t.deviceId, t.pin, t.punchedAt), index('device_punches_user_idx').on(t.userId, t.punchedAt)],
 );
 
 export const visitors = sqliteTable(
