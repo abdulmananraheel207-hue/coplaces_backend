@@ -2,10 +2,8 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import cookieParser from 'cookie-parser';
 import { sql } from 'drizzle-orm';
-import express, { type ErrorRequestHandler } from 'express';
-// Helmet's CommonJS types declare the function as a `default` property, so Vercel's compiler reads a default import
-// as the whole module. Going through `.default` is right under every module setting, here and there.
-import * as helmetModule from 'helmet';
+import express, { type ErrorRequestHandler, type RequestHandler } from 'express';
+import helmetImport, { type HelmetOptions } from 'helmet';
 import { config } from './config.js';
 import type { Db } from './db/client.js';
 import { authenticate, ownerOnly, requireFeature } from './lib/auth.js';
@@ -50,12 +48,16 @@ function sqliteCode(err: unknown): string | undefined {
 
 const HEALTH_TIMEOUT_MS = 5_000;
 
+// Vercel's type check resolves every package to its CommonJS types, where helmet's default import is the module and the
+// function is its `default`. Node loads helmet's ES module at run time, where the default import is the function itself.
+const helmet = ((helmetImport as { default?: unknown }).default ?? helmetImport) as (options?: Readonly<HelmetOptions>) => RequestHandler;
+
 export function createApp(db: Db, opts: { webDist?: string } = {}) {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', 1);
   app.use(
-    helmetModule.default({
+    helmet({
       hsts: config.secureCookies,
       contentSecurityPolicy: {
         useDefaults: true,
