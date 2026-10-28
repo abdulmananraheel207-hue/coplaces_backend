@@ -10,9 +10,10 @@ const migrationsFolder = fileURLToPath(new URL('../../drizzle', import.meta.url)
 
 /**
  * Opens the database and brings its schema up to date. `url` is a Turso database (`libsql://…`, with `authToken`),
- * a local file (`file:path/to.db`) or `:memory:`.
+ * a local file (`file:path/to.db`) or `:memory:`. Pass `migrate: false` where migrations already ran, e.g. a serverless
+ * function whose deploy migrated the database at build time.
  */
-export async function createDb(url: string, authToken?: string) {
+export async function createDb(url: string, authToken?: string, opts: { migrate?: boolean } = {}) {
   if (url.startsWith('file:')) mkdirSync(dirname(fileURLToPath(new URL(url, `file:///${process.cwd()}/`))), { recursive: true });
   const client = createClient({ url, authToken });
   // libsql enforces foreign keys on every connection, local or remote, so there is no pragma to set.
@@ -41,7 +42,7 @@ export async function createDb(url: string, authToken?: string) {
     );
   }
   const db = drizzle(client, { schema });
-  await migrate(db, { migrationsFolder });
+  if (opts.migrate !== false) await migrate(db, { migrationsFolder });
   return db;
 }
 

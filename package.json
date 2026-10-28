@@ -11,7 +11,9 @@
     "db:generate": "drizzle-kit generate",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "create-superadmin": "tsx src/db/create-superadmin.ts"
+    "create-superadmin": "tsx src/db/create-superadmin.ts",
+    "db:migrate": "tsx src/db/migrate.ts",
+    "vercel-build": "npm run db:migrate"
   },
   "dependencies": {
     "@libsql/client": "^0.18.0",
