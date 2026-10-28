@@ -18,6 +18,7 @@ export interface OrgContext {
   packageName: string;
   features: FeatureKey[];
   maxLocations: number | null;
+  maxFloors: number | null;
   maxMembers: number | null;
   periodEnd: string;
   /** The subscription period has run out. Shown as a warning; only suspension blocks access. */
@@ -80,6 +81,7 @@ export async function loadOrgContext(db: Db, organizationId: string): Promise<Or
     packageName: row.pkg.name,
     features: parseFeatures(row.pkg.features),
     maxLocations: row.pkg.maxLocations,
+    maxFloors: row.pkg.maxFloors,
     maxMembers: row.pkg.maxMembers,
     periodEnd: row.org.periodEnd,
     expired:

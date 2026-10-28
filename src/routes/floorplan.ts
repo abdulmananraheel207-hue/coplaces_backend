@@ -11,6 +11,7 @@ import { requirePermission } from '../lib/permissions.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { parse } from '../lib/validate.js';
 import { assertRetirable } from '../services/floorplan.js';
+import { assertFloorsWithinLimit, saveFloors } from '../services/floors.js';
 
 const coord = z.number().min(-300).max(300);
 const size = z.number().min(0.4).max(40);
@@ -65,6 +66,8 @@ const body = z.object({
     .max(200)
     .default([]),
   retire: z.array(z.string()).max(200).default([]),
+  /** Floors added in the editor, kept even when nothing has been placed on them yet. */
+  floors: z.array(floor.min(1)).max(100).default([]),
   objects: z
     .object({
       upsert: z
@@ -150,6 +153,12 @@ export function floorPlanRouter(db: Db) {
     const input = parse(body, req.body);
     assertLocation(req.user!, input.locationId);
     const here = input.locationId;
+    await assertFloorsWithinLimit(db, req.user!, here, [
+      ...input.floors,
+      ...input.create.map((c) => c.floor),
+      ...input.update.flatMap((u) => (u.floor !== undefined ? [u.floor] : [])),
+      ...input.objects.upsert.map((o) => o.floor),
+    ]);
 
     const created = await db.transaction(async (tx) => {
       const t = tx as unknown as Db;
@@ -207,6 +216,7 @@ export function floorPlanRouter(db: Db) {
       return made;
     });
 
+    await saveFloors(db, here, input.floors);
     res.json({ created });
   });
 

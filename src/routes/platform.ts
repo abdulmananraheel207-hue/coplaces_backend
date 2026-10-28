@@ -35,6 +35,7 @@ const packageFields = z.object({
   priceCents: z.number().int().min(0).max(100_000_000_000),
   features: z.array(z.string()),
   maxLocations: limit,
+  maxFloors: limit,
   maxMembers: limit,
   active: z.boolean(),
 });
@@ -47,6 +48,7 @@ const shapePackage = (p: Package, tenants = 0) => ({
   priceCents: p.priceCents,
   features: parseFeatures(p.features),
   maxLocations: p.maxLocations,
+  maxFloors: p.maxFloors,
   maxMembers: p.maxMembers,
   active: p.active,
   tenants,
@@ -123,7 +125,7 @@ export function platformRouter(db: Db) {
   };
 
   r.post('/packages', async (req, res) => {
-    const body = parse(packageFields.partial({ description: true, maxLocations: true, maxMembers: true, active: true }), req.body);
+    const body = parse(packageFields.partial({ description: true, maxLocations: true, maxFloors: true, maxMembers: true, active: true }), req.body);
     const created = await db
       .insert(packages)
       .values({
@@ -133,6 +135,7 @@ export function platformRouter(db: Db) {
         priceCents: body.priceCents,
         features: checkFeatures(body.features),
         maxLocations: body.maxLocations ?? null,
+        maxFloors: body.maxFloors ?? null,
         maxMembers: body.maxMembers ?? null,
         active: body.active ?? true,
       })

@@ -97,6 +97,7 @@ export const packages = sqliteTable('packages', {
   priceCents: integer('price_cents').notNull(),
   features: text('features').notNull().default('[]'), // JSON array of feature keys, see features.ts
   maxLocations: integer('max_locations'), // null = unlimited
+  maxFloors: integer('max_floors'), // per location; null = unlimited
   maxMembers: integer('max_members'), // null = unlimited
   active: integer('active', { mode: 'boolean' }).notNull().default(true),
   createdAt: createdAt(),
@@ -277,6 +278,20 @@ export const resources = sqliteTable(
     createdAt: createdAt(),
   },
   (t) => [uniqueIndex('resources_location_name_idx').on(t.locationId, t.name)],
+);
+
+/** A floor an owner has named for a location, even before anything is placed on it. Spaces and objects carry the same name in their `floor` column. */
+export const locationFloors = sqliteTable(
+  'location_floors',
+  {
+    id: id(),
+    locationId: text('location_id')
+      .notNull()
+      .references(() => locations.id),
+    name: text('name').notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [uniqueIndex('location_floors_loc_name_idx').on(t.locationId, t.name)],
 );
 
 /** Things on a floor that are not rooms or desks and are not booked: a kitchen, a coffee machine, a lounge. */

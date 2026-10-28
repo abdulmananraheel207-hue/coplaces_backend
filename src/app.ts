@@ -18,6 +18,7 @@ import { contractsRouter } from './routes/contracts.js';
 import { devicesRouter } from './routes/devices.js';
 import { expensesRouter } from './routes/expenses.js';
 import { floorPlanRouter } from './routes/floorplan.js';
+import { floorsRouter } from './routes/floors.js';
 import { iclockRouter } from './routes/iclock.js';
 import { invoicesRouter } from './routes/invoices.js';
 import { locationsRouter } from './routes/locations.js';
@@ -111,6 +112,7 @@ export function createApp(db: Db, opts: { webDist?: string } = {}) {
   api.use('/resources', resourcesRouter(db));
   api.use('/assignments', assignmentsRouter(db));
   api.use('/floor-plan', floorPlanRouter(db));
+  api.use('/floors', floorsRouter(db));
   api.use('/bookings', bookingsRouter(db));
   api.use('/contracts', contractsRouter(db));
   api.use('/announcements', announcementsRouter(db));

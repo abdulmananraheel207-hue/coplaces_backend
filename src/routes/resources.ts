@@ -12,6 +12,7 @@ import { idParam, queryString } from '../lib/http.js';
 import { isValidDate, TIME_RE, todayIn } from '../lib/time.js';
 import { byName } from '../lib/sort.js';
 import { parse } from '../lib/validate.js';
+import { assertFloorsWithinLimit } from '../services/floors.js';
 import { assignSpace } from '../services/contracts.js';
 import { assertRetirable } from '../services/floorplan.js';
 
@@ -126,6 +127,7 @@ export function resourcesRouter(db: Db) {
     assertLocation(req.user!, body.locationId);
     checkWindows(body);
     if (body.style !== undefined && !isValidStyle(body.kind, body.style)) throw badRequest(`"${body.style}" is not a style of ${body.kind.replace('_', ' ')}`);
+    await assertFloorsWithinLimit(db, req.user!, body.locationId, [body.floor ?? '']);
     res.status(201).json(await db.insert(resources).values(body).returning().get());
   });
 
@@ -137,6 +139,7 @@ export function resourcesRouter(db: Db) {
     checkWindows({ ...current, ...body });
     if (body.style !== undefined && !isValidStyle(body.kind ?? current.kind, body.style)) throw badRequest(`"${body.style}" is not a style of ${(body.kind ?? current.kind).replace('_', ' ')}`);
     if (body.status === 'retired' && current.status !== 'retired') await assertRetirable(db, current);
+    if (body.floor !== undefined) await assertFloorsWithinLimit(db, req.user!, current.locationId, [body.floor]);
     res.json(await db.update(resources).set(body).where(eq(resources.id, current.id)).returning().get());
   });
 
