@@ -3,7 +3,9 @@ import { join } from 'node:path';
 import cookieParser from 'cookie-parser';
 import { sql } from 'drizzle-orm';
 import express, { type ErrorRequestHandler } from 'express';
-import helmet from 'helmet';
+// Helmet's CommonJS types declare the function as a `default` property, so Vercel's compiler reads a default import
+// as the whole module. Going through `.default` is right under every module setting, here and there.
+import * as helmetModule from 'helmet';
 import { config } from './config.js';
 import type { Db } from './db/client.js';
 import { authenticate, ownerOnly, requireFeature } from './lib/auth.js';
@@ -53,7 +55,7 @@ export function createApp(db: Db, opts: { webDist?: string } = {}) {
   app.disable('x-powered-by');
   app.set('trust proxy', 1);
   app.use(
-    helmet({
+    helmetModule.default({
       hsts: config.secureCookies,
       contentSecurityPolicy: {
         useDefaults: true,
