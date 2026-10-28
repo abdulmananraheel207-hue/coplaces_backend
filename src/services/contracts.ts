@@ -6,6 +6,7 @@ import { loadLocation, loadMember } from '../lib/access.js';
 import { assertLocation, type AuthUser } from '../lib/auth.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { addDays, todayIn, zonedToUtc } from '../lib/time.js';
+import { activateCompany, endCompanyParts, syncContractPeople } from './companyContracts.js';
 
 
 /** Gives a dedicated desk or office to a member for a period. Used by assignments and by contracts. */
@@ -62,14 +63,17 @@ async function load(db: Db, actor: AuthUser, id: string) {
 }
 
 /** Draft to active. A contract on a space hands the space to the member from the start date. */
-export function activateContract(db: Db, actor: AuthUser, id: string) {
-  return db.transaction(async (tx) => {
+export async function activateContract(db: Db, actor: AuthUser, id: string) {
+  const done = await db.transaction(async (tx) => {
     const t = tx as unknown as Db;
     const c = await load(t, actor, id);
     if (c.status !== 'draft') throw conflict(`This contract is already ${c.status}`);
+    if (c.companyName) await activateCompany(t, actor, c);
     const assignment = c.resourceId ? await assignSpace(t, actor, { resourceId: c.resourceId, memberId: c.memberId, startDate: c.startDate, endDate: c.endDate }) : null;
     return t.update(contracts).set({ status: 'active', assignmentId: assignment?.id ?? null }).where(eq(contracts.id, c.id)).returning().get();
   });
+  if (done.companyName) await syncContractPeople(db, done.id);
+  return done;
 }
 
 /** Active to ended on a date (today by default); the space is free again after it. */
@@ -78,12 +82,13 @@ export function endContract(db: Db, actor: AuthUser, id: string, date?: string) 
     const t = tx as unknown as Db;
     const c = await load(t, actor, id);
     if (c.status !== 'active') throw conflict('Only an active contract can be ended');
-    const endDate = date ?? todayIn((await loadLocation(t, c.locationId)).timezone);
+    const today = todayIn((await loadLocation(t, c.locationId)).timezone);
+    const endDate = date ?? today;
     if (endDate < c.startDate) throw badRequest('End date is before the contract started');
+    if (c.companyName) await endCompanyParts(t, c, endDate, today);
     if (c.assignmentId) {
       // An end date is the last day the member has the space, so ending it today frees it from today: the assignment stops the day before,
       // or disappears if it never had a day of its own.
-      const today = todayIn((await loadLocation(t, c.locationId)).timezone);
       const last = endDate <= today ? addDays(endDate, -1) : endDate;
       const a = await t.select().from(resourceAssignments).where(eq(resourceAssignments.id, c.assignmentId)).get();
       if (a && last < a.startDate) await t.delete(resourceAssignments).where(eq(resourceAssignments.id, a.id)).run();

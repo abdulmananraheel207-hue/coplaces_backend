@@ -62,6 +62,7 @@ export const INVOICE_STATUSES = ['open', 'paid', 'void'] as const;
 export const INVOICE_KINDS = ['subscription', 'manual'] as const;
 export const PAYMENT_METHODS = ['cash', 'card', 'bank_transfer', 'jazzcash', 'easypaisa', 'cheque', 'other'] as const;
 export const CONTRACT_STATUSES = ['draft', 'active', 'ended', 'cancelled'] as const;
+export const PRICING_MODES = ['per_member', 'fixed'] as const;
 export const DEPOSIT_STATUSES = ['pending', 'held', 'refunded', 'forfeited'] as const;
 export const DEPOSIT_ENTRY_KINDS = ['received', 'refunded', 'kept', 'advance'] as const;
 export const EXPENSE_CATEGORIES = [
@@ -664,12 +665,59 @@ export const contracts = sqliteTable(
     advanceReceivedAt: text('advance_received_at'),
     status: text('status', { enum: CONTRACT_STATUSES }).notNull().default('draft'),
     notes: text('notes').notNull().default(''),
+    /** A contract with a company name is a company contract: its employees are in `contractPeople`, and `memberId` is the one billed. */
+    companyName: text('company_name').notNull().default(''),
+    companyEmail: text('company_email').notNull().default(''),
+    companyPhone: text('company_phone').notNull().default(''),
+    /** Per member: each person is charged `pricePerMemberCents`. Fixed: the spaces cost `fixedPriceCents`, whoever sits there. */
+    pricingMode: text('pricing_mode', { enum: PRICING_MODES }).notNull().default('per_member'),
+    pricePerMemberCents: integer('price_per_member_cents').notNull().default(0), // per month
+    /** What a person pays when the shared space is already full and they squeeze in anyway. */
+    extraMemberCents: integer('extra_member_cents').notNull().default(0), // per month
+    fixedPriceCents: integer('fixed_price_cents').notNull().default(0), // per month
     createdById: text('created_by_id')
       .notNull()
       .references(() => users.id),
     createdAt: createdAt(),
   },
   (t) => [index('contracts_location_idx').on(t.locationId, t.status), index('contracts_member_idx').on(t.memberId)],
+);
+
+/** An employee on a company contract. They are real members, so bookings and check-in work as usual. */
+export const contractPeople = sqliteTable(
+  'contract_people',
+  {
+    id: id(),
+    contractId: text('contract_id')
+      .notNull()
+      .references(() => contracts.id),
+    memberId: text('member_id')
+      .notNull()
+      .references(() => members.id),
+    /** A hot desk or dedicated desk that is theirs alone. Null means they share the contract's room or office. */
+    deskResourceId: text('desk_resource_id').references(() => resources.id),
+    assignmentId: text('assignment_id'),
+    joinDate: text('join_date').notNull(),
+    leaveDate: text('leave_date'),
+    createdAt: createdAt(),
+  },
+  (t) => [index('contract_people_contract_idx').on(t.contractId), index('contract_people_member_idx').on(t.memberId)],
+);
+
+/** A space the company rents together: a room, an office, or desks they share. */
+export const contractSpaces = sqliteTable(
+  'contract_spaces',
+  {
+    id: id(),
+    contractId: text('contract_id')
+      .notNull()
+      .references(() => contracts.id),
+    resourceId: text('resource_id')
+      .notNull()
+      .references(() => resources.id),
+    assignmentId: text('assignment_id'),
+  },
+  (t) => [index('contract_spaces_contract_idx').on(t.contractId)],
 );
 
 /**
@@ -713,6 +761,9 @@ export const shiftTemplates = sqliteTable(
       .notNull()
       .references(() => locations.id),
     name: text('name').notNull(),
+    /** The plan this shift belongs to. Null for shifts made before shifts lived inside plans: those stay open to everyone. */
+    planId: text('plan_id').references(() => plans.id),
+    /** Older way of scoping a shift to one space or kind. New shifts list their spaces in `shiftSpaces` instead. */
     resourceId: text('resource_id').references(() => resources.id),
     kind: text('kind', { enum: RESOURCE_KINDS }),
     startTime: text('start_time').notNull(),
@@ -723,6 +774,20 @@ export const shiftTemplates = sqliteTable(
     createdAt: createdAt(),
   },
   (t) => [index('shift_templates_location_idx').on(t.locationId)],
+);
+
+/** The spaces a shift is limited to. A shift with none works for every bookable space. */
+export const shiftSpaces = sqliteTable(
+  'shift_spaces',
+  {
+    shiftId: text('shift_id')
+      .notNull()
+      .references(() => shiftTemplates.id, { onDelete: 'cascade' }),
+    resourceId: text('resource_id')
+      .notNull()
+      .references(() => resources.id),
+  },
+  (t) => [primaryKey({ columns: [t.shiftId, t.resourceId] })],
 );
 
 /** A notice to members. A draft is hidden; with a publish time it goes live then, without one it is live at once. */

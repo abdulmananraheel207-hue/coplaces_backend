@@ -1,6 +1,6 @@
 import { and, eq, gt, gte, inArray, isNull, lt, lte, ne, or } from 'drizzle-orm';
 import type { Db, Tx } from '../db/client.js';
-import { attendance, bookings, locationHolidays, members, plans, resourceAssignments, resources, shiftTemplates, users } from '../db/schema.js';
+import { attendance, bookings, contractPeople, contractSpaces, locationHolidays, members, plans, resourceAssignments, resources, shiftSpaces, shiftTemplates, users } from '../db/schema.js';
 import { isAssigned, isHourly } from '../catalogue.js';
 import { deskPriceCents, hasExtras, roomPriceCents, type RateCard } from './pricing.js';
 import { assertLocation, isStaff, type AuthUser } from '../lib/auth.js';
@@ -24,14 +24,18 @@ export async function closedReason(db: Db, loc: { id: string; closedWeekdays: st
 }
 
 /** The shift a booking matches exactly, if the owner set one up for this space: the space's own first, then its kind, then any. */
-export async function matchShift(tx: Tx, resource: { id: string; kind: string; locationId: string }, startTime: string, endTime: string) {
-  const rows = (await tx
+export async function matchShift(tx: Tx, resource: { id: string; kind: string; locationId: string }, startTime: string, endTime: string, planId: string | null = null) {
+  // A plan's shifts are for the members on that plan; shifts that belong to no plan are for everyone.
+  const found = (await tx
     .select()
     .from(shiftTemplates)
     .where(and(eq(shiftTemplates.locationId, resource.locationId), eq(shiftTemplates.active, true), eq(shiftTemplates.startTime, startTime), eq(shiftTemplates.endTime, endTime)))
     .all())
-    .filter((t) => t.resourceId === resource.id || (!t.resourceId && (!t.kind || t.kind === resource.kind)));
-  const rank = (t: (typeof rows)[number]) => (t.resourceId ? 0 : t.kind ? 1 : 2);
+    .filter((t) => !t.planId || t.planId === planId);
+  const listed = found.length ? await tx.select().from(shiftSpaces).where(inArray(shiftSpaces.shiftId, found.map((t) => t.id))).all() : [];
+  const spacesOf = (t: (typeof found)[number]) => listed.filter((s) => s.shiftId === t.id);
+  const rows = found.filter((t) => (spacesOf(t).length ? spacesOf(t).some((s) => s.resourceId === resource.id) : t.resourceId === resource.id || (!t.resourceId && (!t.kind || t.kind === resource.kind))));
+  const rank = (t: (typeof rows)[number]) => (spacesOf(t).length || t.resourceId ? 0 : t.kind ? 1 : 2);
   return rows.sort((a, b) => rank(a) - rank(b))[0];
 }
 
@@ -110,13 +114,18 @@ async function planBooking(tx: Tx, req: BookingRequest, actor: AuthUser, now: Da
 
     // A space rented to a member on a contract is theirs; nobody else can book it while the rent runs.
     const renter = await tx
-      .select({ name: users.name, memberId: resourceAssignments.memberId })
+      .select({ name: users.name, memberId: resourceAssignments.memberId, assignmentId: resourceAssignments.id })
       .from(resourceAssignments)
       .innerJoin(members, eq(members.id, resourceAssignments.memberId))
       .innerJoin(users, eq(users.id, members.userId))
       .where(and(eq(resourceAssignments.resourceId, resource.id), lte(resourceAssignments.startDate, req.date), or(isNull(resourceAssignments.endDate), gte(resourceAssignments.endDate, req.date))))
       .get();
-    if (renter && renter.memberId !== member.id) throw conflict(`${resource.name} is rented to ${renter.name} on that day`);
+    if (renter && renter.memberId !== member.id) {
+      // A space a company rents together can be booked by everyone on that company's contract.
+      const shared = await tx.select({ contractId: contractSpaces.contractId }).from(contractSpaces).where(eq(contractSpaces.assignmentId, renter.assignmentId)).get();
+      const inCompany = shared && (await tx.select({ id: contractPeople.id }).from(contractPeople).where(and(eq(contractPeople.contractId, shared.contractId), eq(contractPeople.memberId, member.id), isNull(contractPeople.leaveDate))).get());
+      if (!inCompany) throw conflict(`${resource.name} is rented to ${renter.name} on that day`);
+    }
 
     const clash = await tx
       .select({ id: bookings.id })
@@ -184,7 +193,7 @@ async function planBooking(tx: Tx, req: BookingRequest, actor: AuthUser, now: Da
     if (resource.kind === 'corporate_room') {
       // Corporate rooms are premium: always their own rates, never the plan's included minutes.
       billableMinutes = duration;
-      const shift = await matchShift(tx, resource, startTime, endTime);
+      const shift = await matchShift(tx, resource, startTime, endTime, plan?.id ?? null);
       priceCents = shift?.priceCents != null ? shift.priceCents : Math.round(hasExtras(card) ? roomPriceCents(card, startTime, endTime, hasPlan) : (resource.hourlyRateCents * duration) / 60);
       basis = shift?.priceCents != null ? { type: 'shift', name: shift.name } : hasExtras(card) ? { type: 'rates' } : { type: 'hourly', rateCents: resource.hourlyRateCents };
     } else if (resource.kind === 'room') {
@@ -208,7 +217,7 @@ async function planBooking(tx: Tx, req: BookingRequest, actor: AuthUser, now: Da
       const freeLeft = Math.max(0, (plan?.includedMeetingMinutes ?? 0) - freeUsed);
       billableMinutes = duration - Math.min(duration, freeLeft);
       // A shift with its own price is charged in full and leaves the included minutes alone. Otherwise only the minutes beyond the allowance are charged, at the booking's own average rate.
-      const shift = await matchShift(tx, resource, startTime, endTime);
+      const shift = await matchShift(tx, resource, startTime, endTime, plan?.id ?? null);
       if (shift?.priceCents != null) {
         billableMinutes = duration;
         priceCents = shift.priceCents;
@@ -219,7 +228,7 @@ async function planBooking(tx: Tx, req: BookingRequest, actor: AuthUser, now: Da
       }
     } else {
       const free = plan?.includesHotDesk ?? false;
-      const shift = await matchShift(tx, resource, startTime, endTime);
+      const shift = await matchShift(tx, resource, startTime, endTime, plan?.id ?? null);
       const day = deskPriceCents(card, hasPlan);
       if (free) {
         priceCents = 0;

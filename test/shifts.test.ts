@@ -131,9 +131,8 @@ describe('shift templates', () => {
     const base = { locationId: ctx.loc.id, name: 'X', startTime: '09:00', endTime: '14:00' };
     await owner.post('/api/shifts').send({ ...base, endTime: '08:00' }).expect(400);
     await owner.post('/api/shifts').send({ ...base, endTime: '14:10' }).expect(400);
-    await owner.post('/api/shifts').send({ ...base, resourceId: ctx.dedicated.id }).expect(400);
-    await owner.post('/api/shifts').send({ ...base, kind: 'storage' }).expect(400);
-    await owner.post('/api/shifts').send({ ...base, resourceId: ctx.room.id }).expect(201);
+    await owner.post('/api/shifts').send({ ...base, spaceIds: [ctx.dedicated.id] }).expect(400);
+    await owner.post('/api/shifts').send({ ...base, spaceIds: [ctx.room.id] }).expect(201);
   });
 
   it('charges the shift price when a booking matches it exactly, preferring the most specific shift', async () => {
@@ -145,9 +144,9 @@ describe('shift templates', () => {
 
     await ctx.db.update(resources).set({ hourlyRateCents: 500, dailyRateCents: 2_500 }).where(eq(resources.id, ctx.desk.id)).run();
     expect((await quote(ctx.desk.id, ctx.basic.member.id)).body.priceCents).toBe(2_500); // capped hourly, no shift yet
-    await owner.post('/api/shifts').send({ ...slot, name: 'Morning', kind: 'hot_desk', priceCents: 1_200 }).expect(201);
+    await owner.post('/api/shifts').send({ ...slot, name: 'Morning', priceCents: 1_200 }).expect(201);
     expect((await quote(ctx.desk.id, ctx.basic.member.id)).body.priceCents).toBe(1_200);
-    await owner.post('/api/shifts').send({ ...slot, name: 'Desk 1 morning', resourceId: ctx.desk.id, priceCents: 900 }).expect(201);
+    await owner.post('/api/shifts').send({ ...slot, name: 'Desk 1 morning', spaceIds: [ctx.desk.id], priceCents: 900 }).expect(201);
     expect((await quote(ctx.desk.id, ctx.basic.member.id)).body.priceCents).toBe(900);
     expect((await quote(ctx.desk2.id, ctx.basic.member.id)).body.priceCents).toBe(1_200);
     // Not an exact match, so the hourly working applies again.
@@ -169,5 +168,56 @@ describe('shift templates', () => {
     expect((await quote()).body.priceCents).toBe(15_000);
     await owner.patch(`/api/shifts/${s.body.id}`).send({ active: false }).expect(200);
     expect((await quote()).body.priceCents).toBe(24_000); // 4 hours at 60.00
+  });
+});
+
+describe('shifts inside plans', () => {
+  it('only prices bookings for members on the plan, and only in the chosen spaces', async () => {
+    const ctx = await setup();
+    const owner = await login(ctx.app, 'owner@test.dev');
+    const quote = (resourceId: string, memberId: string) =>
+      owner.post('/api/bookings/quote').send({ resourceId, memberId, date: day, startTime: '09:00', endTime: '14:00' }).expect(200);
+    await ctx.db.update(resources).set({ hourlyRateCents: 500, dailyRateCents: 2_500 }).where(eq(resources.id, ctx.desk.id)).run();
+
+    const shift = await owner
+      .post('/api/shifts')
+      .send({ locationId: ctx.loc.id, planId: ctx.basicPlan.id, name: 'Morning', startTime: '09:00', endTime: '14:00', priceCents: 700, spaceIds: [ctx.desk.id] })
+      .expect(201);
+    expect(shift.body).toMatchObject({ planId: ctx.basicPlan.id, spaceIds: [ctx.desk.id] });
+
+    expect((await quote(ctx.desk.id, ctx.basic.member.id)).body.priceCents).toBe(700); // on the plan, in the space
+    expect((await quote(ctx.desk2.id, ctx.basic.member.id)).body.priceCents).not.toBe(700); // not a chosen space
+
+    // members and staff only see the shifts that are theirs
+    const mine = await login(ctx.app, 'basic@test.dev');
+    expect((await mine.get(`/api/shifts?locationId=${ctx.loc.id}`).expect(200)).body).toHaveLength(1);
+    const other = await login(ctx.app, 'pro@test.dev');
+    expect((await other.get(`/api/shifts?locationId=${ctx.loc.id}`).expect(200)).body).toHaveLength(0);
+    expect((await owner.get(`/api/shifts?locationId=${ctx.loc.id}&memberId=${ctx.pro.member.id}`).expect(200)).body).toHaveLength(0);
+    expect((await owner.get(`/api/shifts?locationId=${ctx.loc.id}`).expect(200)).body).toHaveLength(1);
+
+    // edit: change the spaces and the price
+    const edited = await owner.patch(`/api/shifts/${shift.body.id}`).send({ priceCents: 800, spaceIds: [ctx.desk.id, ctx.desk2.id] }).expect(200);
+    expect(edited.body.spaceIds.sort()).toEqual([ctx.desk.id, ctx.desk2.id].sort());
+    expect((await quote(ctx.desk2.id, ctx.basic.member.id)).body.priceCents).toBe(800);
+  });
+
+  it('deleting a plan deletes its shifts and leaves its members without a plan', async () => {
+    const ctx = await setup();
+    const owner = await login(ctx.app, 'owner@test.dev');
+    await owner.post('/api/shifts').send({ locationId: ctx.loc.id, planId: ctx.basicPlan.id, name: 'Morning', startTime: '09:00', endTime: '14:00' }).expect(201);
+    await owner.delete(`/api/plans/${ctx.basicPlan.id}`).expect(204);
+    expect((await owner.get(`/api/shifts?locationId=${ctx.loc.id}`)).body).toHaveLength(0);
+    expect((await owner.get(`/api/plans?locationId=${ctx.loc.id}`)).body.map((p: { id: string }) => p.id)).not.toContain(ctx.basicPlan.id);
+    const m = await owner.get(`/api/members/${ctx.basic.member.id}`).expect(200);
+    expect(m.body.planId ?? m.body.member?.planId ?? null).toBeNull();
+    await owner.delete(`/api/plans/${ctx.basicPlan.id}`).expect(404);
+  });
+
+  it('makes a plan with no price of its own', async () => {
+    const ctx = await setup();
+    const owner = await login(ctx.app, 'owner@test.dev');
+    const made = await owner.post('/api/plans').send({ locationId: ctx.loc.id, name: 'Day Pass', interval: 'day' }).expect(201);
+    expect(made.body.priceCents).toBe(0);
   });
 });

@@ -1,12 +1,13 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
-import { and, asc, desc, eq, gt, inArray, isNull, like, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, inArray, isNull, like, ne, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import type { Db } from '../db/client.js';
 import {
   MEMBER_STATUSES,
   attendance,
   bookings,
+  contractPeople,
   contracts,
   invoices,
   members,
@@ -32,6 +33,20 @@ async function checkPlan(db: Db, planId: string | null | undefined, locationId: 
   if (!planId) return;
   const plan = await db.select().from(plans).where(eq(plans.id, planId)).get();
   if (!plan || plan.locationId !== locationId) throw badRequest('Plan does not belong to this location');
+}
+
+/** The company each of these members came in through, for members created from a company contract. */
+async function contractCompanies(db: Db, memberIds: string[]) {
+  const out = new Map<string, string>();
+  if (!memberIds.length) return out;
+  const rows = await db
+    .select({ memberId: contractPeople.memberId, company: contracts.companyName })
+    .from(contractPeople)
+    .innerJoin(contracts, eq(contracts.id, contractPeople.contractId))
+    .where(and(inArray(contractPeople.memberId, memberIds), ne(contracts.companyName, '')))
+    .all();
+  for (const r of rows) out.set(r.memberId, r.company);
+  return out;
 }
 
 export function membersRouter(db: Db) {
@@ -65,9 +80,11 @@ export function membersRouter(db: Db) {
         .all())
         .map((a) => a.memberId),
     );
+    const companies = await contractCompanies(db, rows.map(({ member }) => member.id));
     res.json(
       rows.map(({ member, user, plan }) => ({
         ...member,
+        contractCompany: companies.get(member.id) ?? null,
         name: user.name,
         email: user.email,
         phone: user.phone,
@@ -155,6 +172,7 @@ export function membersRouter(db: Db) {
       .all();
     res.json({
       ...member,
+      contractCompany: (await contractCompanies(db, [member.id])).get(member.id) ?? null,
       name: user.name,
       email: user.email,
       phone: user.phone,

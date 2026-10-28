@@ -1,9 +1,11 @@
 import { and, asc, eq, inArray, isNull, lt, ne, sql } from 'drizzle-orm';
 import type { Db, DbLike } from '../db/client.js';
-import { bookings, invoiceItems, invoices, locations, members, payments, plans, resources } from '../db/schema.js';
+import { bookings, contractPeople, contracts, invoiceItems, invoices, locations, members, payments, plans, resources, users } from '../db/schema.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { addDays, localDate, localTime, monthRange, todayIn } from '../lib/time.js';
 import { loadLocation } from '../lib/access.js';
+import { monthCharges } from './contractPricing.js';
+import { seatsOf } from './companyContracts.js';
 
 export type Invoice = typeof invoices.$inferSelect;
 export type PaymentMethod = (typeof payments.$inferSelect)['method'];
@@ -171,10 +173,13 @@ export function generateSubscriptionInvoices(
       .where(and(eq(members.locationId, loc.id), eq(members.status, 'active')))
       .all())
       .filter(({ member }) => member.startDate < range.nextFirstDay && (!member.endDate || member.endDate >= range.firstDay));
+    // Employees on a company contract are billed on the company's invoice, not their own.
+    const onContract = new Set((await tx.select({ id: contractPeople.memberId }).from(contractPeople).all()).map((x) => x.id));
+    const own = candidates.filter(({ member }) => !onContract.has(member.id));
 
     const created: Invoice[] = [];
     let skipped = 0;
-    for (const { member, plan } of candidates) {
+    for (const { member, plan } of own) {
       const existing = await tx
         .select({ id: invoices.id })
         .from(invoices)
@@ -197,32 +202,7 @@ export function generateSubscriptionInvoices(
         items.push({ description: `${plan.name} membership — ${monthLabel}`, quantity: 1, unitPriceCents: plan.priceCents });
       }
 
-      const unbilled = (await tx
-        .select({ booking: bookings, resourceName: resources.name })
-        .from(bookings)
-        .innerJoin(resources, eq(resources.id, bookings.resourceId))
-        .where(
-          and(
-            eq(bookings.memberId, member.id),
-            isNull(bookings.invoiceId),
-            inArray(bookings.status, ['confirmed', 'completed']),
-            lt(bookings.startsAt, range.end),
-            lt(bookings.startsAt, now.toISOString()),
-          ),
-        )
-        .orderBy(asc(bookings.startsAt))
-        .all())
-        .filter(({ booking }) => booking.priceCents > 0);
-      for (const { booking, resourceName } of unbilled) {
-        const day = localDate(booking.startsAt, loc.timezone);
-        const span = `${localTime(booking.startsAt, loc.timezone)}–${localTime(booking.endsAt, loc.timezone)}`;
-        items.push({
-          description: `${resourceName} booking, ${day} ${span}`,
-          quantity: 1,
-          unitPriceCents: booking.priceCents,
-          bookingId: booking.id,
-        });
-      }
+      items.push(...(await bookingItems(tx, [member.id], range, loc.timezone, now)));
 
       if (items.length === 0) {
         skipped++;
@@ -240,8 +220,61 @@ export function generateSubscriptionInvoices(
         }),
       );
     }
+    // One invoice per company: each person's share of the rent, then every employee's unbilled bookings.
+    const companies = (await tx.select().from(contracts).where(and(eq(contracts.locationId, loc.id), ne(contracts.companyName, ''), inArray(contracts.status, ['active', 'ended']))).all()).filter(
+      (c) => c.startDate < range.nextFirstDay && (!c.endDate || c.endDate >= range.firstDay),
+    );
+    for (const c of companies) {
+      const done = await tx
+        .select({ id: invoices.id })
+        .from(invoices)
+        .where(and(eq(invoices.memberId, c.memberId), eq(invoices.kind, 'subscription'), eq(invoices.periodStart, range.firstDay), ne(invoices.status, 'void')))
+        .get();
+      if (done) {
+        skipped++;
+        continue;
+      }
+      const people = (await tx
+        .select({ p: contractPeople, name: users.name })
+        .from(contractPeople)
+        .innerJoin(members, eq(members.id, contractPeople.memberId))
+        .innerJoin(users, eq(users.id, members.userId))
+        .where(eq(contractPeople.contractId, c.id))
+        .all());
+      const rent = monthCharges(
+        { pricingMode: c.pricingMode, pricePerMemberCents: c.pricePerMemberCents, extraMemberCents: c.extraMemberCents, fixedPriceCents: c.fixedPriceCents, startDate: c.startDate, endDate: c.endDate },
+        people.map(({ p, name }) => ({ name, joinDate: p.joinDate, leaveDate: p.leaveDate, hasDesk: !!p.deskResourceId })),
+        await seatsOf(tx as unknown as Db, c.id),
+        range.firstDay,
+        range.nextFirstDay,
+      );
+      const items: LineItem[] = rent.map((l) => ({ description: `${c.companyName}: ${l.description} — ${monthLabel}`, quantity: 1, unitPriceCents: l.amountCents }));
+      items.push(...(await bookingItems(tx, people.map(({ p }) => p.memberId), range, loc.timezone, now)));
+      if (!items.length) {
+        skipped++;
+        continue;
+      }
+      created.push(await createInvoice(tx, { locationId: loc.id, memberId: c.memberId, kind: 'subscription', issueDate, dueDate, periodStart: range.firstDay, items }));
+    }
     return { created, skipped };
   });
+}
+
+/** Paid bookings that have happened and are not on an invoice yet, as invoice lines. */
+async function bookingItems(tx: DbLike, memberIds: string[], range: { end: string }, tz: string, now: Date): Promise<LineItem[]> {
+  const unbilled = (await tx
+    .select({ booking: bookings, resourceName: resources.name })
+    .from(bookings)
+    .innerJoin(resources, eq(resources.id, bookings.resourceId))
+    .where(and(inArray(bookings.memberId, memberIds), isNull(bookings.invoiceId), inArray(bookings.status, ['confirmed', 'completed']), lt(bookings.startsAt, range.end), lt(bookings.startsAt, now.toISOString())))
+    .orderBy(asc(bookings.startsAt))
+    .all()).filter(({ booking }) => booking.priceCents > 0);
+  return unbilled.map(({ booking, resourceName }) => ({
+    description: `${resourceName} booking, ${localDate(booking.startsAt, tz)} ${localTime(booking.startsAt, tz)}–${localTime(booking.endsAt, tz)}`,
+    quantity: 1,
+    unitPriceCents: booking.priceCents,
+    bookingId: booking.id,
+  }));
 }
 
 export function withBalance<T extends Invoice>(inv: T, today: string) {
