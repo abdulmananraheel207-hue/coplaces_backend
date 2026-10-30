@@ -62,6 +62,8 @@ export const INVOICE_STATUSES = ['open', 'paid', 'void'] as const;
 export const INVOICE_KINDS = ['subscription', 'manual'] as const;
 export const PAYMENT_METHODS = ['cash', 'card', 'bank_transfer', 'jazzcash', 'easypaisa', 'cheque', 'other'] as const;
 export const CONTRACT_STATUSES = ['draft', 'active', 'ended', 'cancelled'] as const;
+export const REQUEST_STATUSES = ['pending', 'approved', 'rejected', 'cancelled', 'taken'] as const;
+export const BOOKING_SOURCES = ['manual', 'plan'] as const;
 export const PRICING_MODES = ['per_member', 'fixed'] as const;
 export const DEPOSIT_STATUSES = ['pending', 'held', 'refunded', 'forfeited'] as const;
 export const DEPOSIT_ENTRY_KINDS = ['received', 'refunded', 'kept', 'advance'] as const;
@@ -226,6 +228,20 @@ export const members = sqliteTable(
     status: text('status', { enum: MEMBER_STATUSES }).notNull().default('active'),
     startDate: text('start_date').notNull(),
     endDate: text('end_date'),
+    /** The current period of the plan with shifts: from its first day to its last. Null for members without shifts. */
+    planStart: text('plan_start'),
+    planEnd: text('plan_end'),
+    /** Paid up front, and taken off the shift prices on their invoices until it is used up. */
+    advanceCents: integer('advance_cents').notNull().default(0),
+    /** How much of the advance has been taken off invoices so far. */
+    advanceUsedCents: integer('advance_used_cents').notNull().default(0),
+    advanceReceivedAt: text('advance_received_at'),
+    /** Held for the member and settled at the end of their plan period. It is not income unless the space keeps some. */
+    depositCents: integer('deposit_cents').notNull().default(0),
+    depositStatus: text('deposit_status', { enum: DEPOSIT_STATUSES }).notNull().default('pending'),
+    depositReturnedCents: integer('deposit_returned_cents').notNull().default(0),
+    /** Free meeting room time given to the member each month, in credit hours. Two credit hours are one hour. */
+    meetingCredits: integer('meeting_credits').notNull().default(0),
     notes: text('notes').notNull().default(''),
     createdAt: createdAt(),
   },
@@ -364,6 +380,8 @@ export const bookings = sqliteTable(
     cancelledAt: text('cancelled_at'),
     /** When the member was checked in at the front desk for this booking. */
     checkedInAt: text('checked_in_at'),
+    /** Plan bookings are made for a member by their plan's shifts, and are paid for by the plan, not one by one. */
+    source: text('source', { enum: BOOKING_SOURCES }).notNull().default('manual'),
     createdAt: createdAt(),
   },
   (t) => [
@@ -371,6 +389,40 @@ export const bookings = sqliteTable(
     index('bookings_member_idx').on(t.memberId, t.startsAt),
     index('bookings_location_idx').on(t.locationId, t.startsAt),
   ],
+);
+
+/**
+ * A member asking the owner for a meeting room, board room or the like, for a time. Members cannot book rooms themselves.
+ * The owner approves (it becomes a booking) or rejects it. When one request for a time is approved, the others for the same
+ * time are marked taken.
+ */
+export const roomRequests = sqliteTable(
+  'room_requests',
+  {
+    id: id(),
+    locationId: text('location_id')
+      .notNull()
+      .references(() => locations.id),
+    resourceId: text('resource_id')
+      .notNull()
+      .references(() => resources.id),
+    memberId: text('member_id')
+      .notNull()
+      .references(() => members.id),
+    date: text('date').notNull(), // 'YYYY-MM-DD'
+    startTime: text('start_time').notNull(),
+    endTime: text('end_time').notNull(),
+    notes: text('notes').notNull().default(''),
+    status: text('status', { enum: REQUEST_STATUSES }).notNull().default('pending'),
+    /** Why it was rejected, or why it was taken. */
+    reason: text('reason').notNull().default(''),
+    decidedById: text('decided_by_id').references(() => users.id),
+    decidedAt: text('decided_at'),
+    /** The booking made when it was approved. */
+    bookingId: text('booking_id'),
+    createdAt: createdAt(),
+  },
+  (t) => [index('room_requests_location_idx').on(t.locationId, t.status), index('room_requests_resource_idx').on(t.resourceId, t.date), index('room_requests_member_idx').on(t.memberId)],
 );
 
 export const attendance = sqliteTable(
@@ -732,9 +784,9 @@ export const depositEntries = sqliteTable(
     locationId: text('location_id')
       .notNull()
       .references(() => locations.id),
-    contractId: text('contract_id')
-      .notNull()
-      .references(() => contracts.id),
+    /** Set for a contract's money; a member's own advance and deposit are on `memberId` instead. */
+    contractId: text('contract_id').references(() => contracts.id),
+    memberId: text('member_id').references(() => members.id),
     kind: text('kind', { enum: DEPOSIT_ENTRY_KINDS }).notNull(),
     amountCents: integer('amount_cents').notNull(),
     /** How the money moved. A kept amount moves no money, so it has none. */
@@ -746,7 +798,68 @@ export const depositEntries = sqliteTable(
       .references(() => users.id),
     createdAt: createdAt(),
   },
-  (t) => [index('deposit_entries_location_idx').on(t.locationId, t.occurredAt), index('deposit_entries_contract_idx').on(t.contractId)],
+  (t) => [index('deposit_entries_location_idx').on(t.locationId, t.occurredAt), index('deposit_entries_contract_idx').on(t.contractId), index('deposit_entries_member_idx').on(t.memberId)],
+);
+
+/** Something the owner gives out at the front desk, like tea or coffee, with the price charged beyond a member's free amount. */
+export const amenities = sqliteTable(
+  'amenities',
+  {
+    id: id(),
+    locationId: text('location_id')
+      .notNull()
+      .references(() => locations.id),
+    name: text('name').notNull(),
+    priceCents: integer('price_cents').notNull(),
+    active: integer('active', { mode: 'boolean' }).notNull().default(true),
+    createdAt: createdAt(),
+  },
+  (t) => [index('amenities_location_idx').on(t.locationId)],
+);
+
+/** How many of an amenity a member gets free each day. A member has no free amount of an amenity that is not listed. */
+export const memberAmenities = sqliteTable(
+  'member_amenities',
+  {
+    memberId: text('member_id')
+      .notNull()
+      .references(() => members.id, { onDelete: 'cascade' }),
+    amenityId: text('amenity_id')
+      .notNull()
+      .references(() => amenities.id, { onDelete: 'cascade' }),
+    freePerDay: integer('free_per_day').notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.memberId, t.amenityId] })],
+);
+
+/** One amenity handed to a member at the front desk. What goes beyond their free amount for the day is charged, and collected later. */
+export const amenityOrders = sqliteTable(
+  'amenity_orders',
+  {
+    id: id(),
+    locationId: text('location_id')
+      .notNull()
+      .references(() => locations.id),
+    memberId: text('member_id')
+      .notNull()
+      .references(() => members.id),
+    amenityId: text('amenity_id')
+      .notNull()
+      .references(() => amenities.id),
+    /** The amenity's name when it was given, so renaming it later does not rewrite history. */
+    name: text('name').notNull(),
+    date: text('date').notNull(), // 'YYYY-MM-DD' in the location's timezone
+    quantity: integer('quantity').notNull(),
+    freeQuantity: integer('free_quantity').notNull(),
+    chargeCents: integer('charge_cents').notNull(),
+    /** When the charge was collected from the member. Null while it is still owed. */
+    collectedAt: text('collected_at'),
+    recordedById: text('recorded_by_id')
+      .notNull()
+      .references(() => users.id),
+    createdAt: createdAt(),
+  },
+  (t) => [index('amenity_orders_member_idx').on(t.memberId, t.date), index('amenity_orders_location_idx').on(t.locationId, t.date)],
 );
 
 /**
@@ -774,6 +887,34 @@ export const shiftTemplates = sqliteTable(
     createdAt: createdAt(),
   },
   (t) => [index('shift_templates_location_idx').on(t.locationId)],
+);
+
+/** The shifts of their plan a member has taken. What they pay is the sum of these shifts' prices. */
+export const memberShifts = sqliteTable(
+  'member_shifts',
+  {
+    memberId: text('member_id')
+      .notNull()
+      .references(() => members.id),
+    shiftId: text('shift_id')
+      .notNull()
+      .references(() => shiftTemplates.id, { onDelete: 'cascade' }),
+  },
+  (t) => [primaryKey({ columns: [t.memberId, t.shiftId] })],
+);
+
+/** The hot desks given to a member by their plan. */
+export const memberDesks = sqliteTable(
+  'member_desks',
+  {
+    memberId: text('member_id')
+      .notNull()
+      .references(() => members.id),
+    resourceId: text('resource_id')
+      .notNull()
+      .references(() => resources.id),
+  },
+  (t) => [primaryKey({ columns: [t.memberId, t.resourceId] })],
 );
 
 /** The spaces a shift is limited to. A shift with none works for every bookable space. */

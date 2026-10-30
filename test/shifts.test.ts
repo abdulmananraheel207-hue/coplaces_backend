@@ -3,7 +3,7 @@ import { eq } from 'drizzle-orm';
 import { resources, users } from '../src/db/schema.js';
 import { checkInMember } from '../src/services/checkin.js';
 import { todayIn, zonedToUtc } from '../src/lib/time.js';
-import { inDays, login, setup, TZ } from './helpers.js';
+import { inDays, login, setup, TZ, entitle } from './helpers.js';
 
 const today = todayIn(TZ);
 const at = (time: string, date = today) => zonedToUtc(date, time, TZ);
@@ -102,6 +102,7 @@ describe('checking in at a desk booked for part of the day', () => {
 
   it('refuses someone with no booking when the desk is booked by another for the current hour', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.basic.member.id);
     const { createBooking } = await import('../src/services/bookings.js');
     await createBooking(ctx.db, { resourceId: ctx.desk.id, memberId: ctx.pro.member.id, date: today, startTime: '14:00', endTime: '16:00', notes: '' }, await staffUser(ctx), at('07:00'));
     await expect(checkInMember(ctx.db, ctx.basic.member, ctx.desk.id, at('13:30'))).rejects.toThrow(/booked today by pro/);
@@ -131,7 +132,9 @@ describe('shift templates', () => {
     const base = { locationId: ctx.loc.id, name: 'X', startTime: '09:00', endTime: '14:00' };
     await owner.post('/api/shifts').send({ ...base, endTime: '08:00' }).expect(400);
     await owner.post('/api/shifts').send({ ...base, endTime: '14:10' }).expect(400);
-    await owner.post('/api/shifts').send({ ...base, spaceIds: [ctx.dedicated.id] }).expect(400);
+    const locker = await ctx.db.insert(resources).values({ locationId: ctx.loc.id, kind: 'storage', name: 'Locker 1' }).returning().get();
+    await owner.post('/api/shifts').send({ ...base, spaceIds: [locker.id] }).expect(400); // lockers cannot have shifts
+    await owner.post('/api/shifts').send({ ...base, spaceIds: [ctx.dedicated.id] }).expect(201); // desks and offices can
     await owner.post('/api/shifts').send({ ...base, spaceIds: [ctx.room.id] }).expect(201);
   });
 

@@ -5,10 +5,15 @@ import { z } from 'zod';
 import type { Db } from '../db/client.js';
 import {
   MEMBER_STATUSES,
+  PAYMENT_METHODS,
   attendance,
   bookings,
   contractPeople,
   contracts,
+  depositEntries,
+  memberDesks,
+  memberShifts,
+  shiftTemplates,
   invoices,
   members,
   plans,
@@ -22,12 +27,19 @@ import { requirePermission } from '../lib/permissions.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { DATE_RE, isValidDate, todayIn } from '../lib/time.js';
 import { finishBookingOnCheckOut } from '../services/checkin.js';
+import { amenityOwed, memberAllowance, setMemberAmenities } from '../services/amenities.js';
+import { deleteMember } from '../services/memberDelete.js';
+import { recordMemberMoney, settleMemberDeposit } from '../services/memberMoney.js';
+import { changePlan, freeSpacesForPlan, renewPlan, startPlanPeriod } from '../services/planBookings.js';
 import { syncUser } from '../services/devices.js';
 import { idParam } from '../lib/http.js';
 import { tempPassword } from '../lib/passwords.js';
 import { parse } from '../lib/validate.js';
 
 const dateStr = z.string().refine(isValidDate, 'Use YYYY-MM-DD');
+/** The amenities a member gets free each day, and the meeting room credit hours (two make an hour) they get each month. */
+const freeAmenities = z.array(z.object({ amenityId: z.string(), freePerDay: z.number().int().min(1).max(1000) })).max(100);
+const meetingCredits = z.number().int().min(0).max(10_000);
 
 async function checkPlan(db: Db, planId: string | null | undefined, locationId: string) {
   if (!planId) return;
@@ -108,12 +120,28 @@ export function membersRouter(db: Db) {
         startDate: dateStr.optional(),
         notes: z.string().trim().max(2000).default(''),
         password: z.string().min(8).optional(),
+        /** Which of the plan's shifts they take, and the desks or offices they are given for them. */
+        shiftIds: z.array(z.string()).max(50).default([]),
+        deskIds: z.array(z.string()).max(50).default([]),
+        /** Paid when they join: the advance comes off the shift prices, and the deposit is held until the end of the plan period. */
+        advanceCents: z.number().int().min(0).max(1_000_000_000_000).default(0),
+        depositCents: z.number().int().min(0).max(1_000_000_000_000).default(0),
+        method: z.enum(PAYMENT_METHODS).default('cash'),
+        reference: z.string().trim().max(100).default(''),
+        amenities: freeAmenities.default([]),
+        meetingCredits: meetingCredits.default(0),
       }),
       req.body,
     );
     assertLocation(req.user!, body.locationId);
     const loc = await loadLocation(db, body.locationId);
     await checkPlan(db, body.planId, loc.id);
+    const plan = body.planId ? await db.select().from(plans).where(eq(plans.id, body.planId)).get() : undefined;
+    const planShifts = plan ? await db.select({ id: shiftTemplates.id }).from(shiftTemplates).where(and(eq(shiftTemplates.planId, plan.id), eq(shiftTemplates.active, true))).all() : [];
+    if (plan && planShifts.length && !body.shiftIds.length) throw badRequest('Choose at least one of the plan\'s shifts');
+    if (!plan && (body.shiftIds.length || body.deskIds.length)) throw badRequest('Shifts belong to a plan. Choose the plan first');
+    if (body.deskIds.length && !body.shiftIds.length) throw badRequest('Choose the shifts the desks are for');
+    if (body.shiftIds.length && body.status !== 'active') throw badRequest('Start the member as Active to give them shifts');
     if (body.status !== 'cancelled') await assertWithinLimit(db, req.user!, 'members');
     if (await db.select().from(users).where(eq(users.email, body.email)).get()) throw conflict('That email is already in use');
 
@@ -125,7 +153,7 @@ export function membersRouter(db: Db) {
         .values({ organizationId: loc.organizationId, name: body.name, email: body.email, phone: body.phone, role: 'member', passwordHash })
         .returning()
         .get();
-      return tx
+      const created = await tx
         .insert(members)
         .values({
           userId: user.id,
@@ -135,9 +163,17 @@ export function membersRouter(db: Db) {
           status: body.status,
           startDate: body.startDate ?? todayIn(loc.timezone),
           notes: body.notes,
+          meetingCredits: body.meetingCredits,
         })
         .returning()
         .get();
+      await setMemberAmenities(tx as unknown as Db, created.id, loc.id, body.amenities);
+      // What they paid when joining is recorded before the first invoice, so the advance comes off it.
+      if (body.advanceCents || body.depositCents) await recordMemberMoney(tx as unknown as Db, req.user!, created.id, { advanceCents: body.advanceCents, depositCents: body.depositCents, method: body.method, reference: body.reference });
+      // Shifts, desks and the first period of the plan are made together with the member, or not at all.
+      if (!plan || !body.shiftIds.length) return created;
+      await startPlanPeriod(tx as unknown as Db, req.user!, created.id, plan, body.shiftIds, body.deskIds, body.startDate ?? todayIn(loc.timezone));
+      return (await tx.select().from(members).where(eq(members.id, created.id)).get())!;
     });
     await syncUser(db, member.userId);
     const { devicePin } = (await db.select({ devicePin: users.devicePin }).from(users).where(eq(users.id, member.userId)).get())!;
@@ -149,6 +185,50 @@ export function membersRouter(db: Db) {
       devicePin,
       tempPassword: body.password ? undefined : password,
     });
+  });
+
+  /** The desks and offices that are free for a plan's shifts from a start date, for the new member form. */
+  r.get('/available-spaces', requirePermission('members'), async (req, res) => {
+    const locationId = requireLocationId(req);
+    const planId = typeof req.query.planId === 'string' ? req.query.planId : '';
+    const shiftIds = typeof req.query.shiftIds === 'string' ? req.query.shiftIds.split(',').filter(Boolean) : [];
+    const startDate = typeof req.query.startDate === 'string' ? req.query.startDate : '';
+    if (!planId || !isValidDate(startDate)) throw badRequest('planId and startDate are required');
+    const exceptMemberId = typeof req.query.memberId === 'string' && req.query.memberId ? req.query.memberId : undefined;
+    const out = await freeSpacesForPlan(db, req.user!, planId, shiftIds, startDate, exceptMemberId);
+    const plan = (await db.select({ l: plans.locationId }).from(plans).where(eq(plans.id, planId)).get())!;
+    if (plan.l !== locationId) throw badRequest('Plan does not belong to this location');
+    res.json({ end: out.end, spaces: out.spaces.map((s) => ({ id: s.id, name: s.name, kind: s.kind, floor: s.floor })) });
+  });
+
+  /** Changes a member's plan, shifts or desks, re-booking what has not happened yet. */
+  r.put('/:id/plan', requirePermission('members'), async (req, res) => {
+    const body = parse(z.object({ planId: z.string().nullable(), shiftIds: z.array(z.string()).max(50).default([]), deskIds: z.array(z.string()).max(50).default([]), startDate: dateStr.optional() }), req.body);
+    res.json(await changePlan(db, req.user!, idParam(req), { planId: body.planId, shiftIds: body.shiftIds, spaceIds: body.deskIds, startDate: body.startDate }));
+  });
+
+  /** Removes a member who was added by mistake. Anyone with history that must stay is cancelled instead. */
+  r.delete('/:id', requirePermission('members'), async (req, res) => {
+    await deleteMember(db, req.user!, idParam(req));
+    res.status(204).end();
+  });
+
+  /** Records an advance or a security deposit that was forgotten when the member was added. */
+  r.post('/:id/money', requirePermission('members'), async (req, res) => {
+    const body = parse(z.object({ advanceCents: z.number().int().min(0).max(1_000_000_000_000).optional(), depositCents: z.number().int().min(0).max(1_000_000_000_000).optional(), method: z.enum(PAYMENT_METHODS).default('cash'), reference: z.string().trim().max(100).default('') }), req.body);
+    await db.transaction((tx) => recordMemberMoney(tx as unknown as Db, req.user!, idParam(req), body));
+    res.status(204).end();
+  });
+
+  /** Settles the security deposit at the end of the plan period: some or all goes back, the rest is kept. */
+  r.post('/:id/deposit', requirePermission('members'), async (req, res) => {
+    const body = parse(z.object({ action: z.enum(['refund', 'forfeit']), returnedCents: z.number().int().min(0).optional(), method: z.enum(PAYMENT_METHODS).default('cash'), reference: z.string().trim().max(100).default('') }), req.body);
+    res.json(await settleMemberDeposit(db, req.user!, idParam(req), body));
+  });
+
+  r.post('/:id/renew', requirePermission('members'), async (req, res) => {
+    const body = parse(z.object({ startDate: dateStr.optional() }), req.body);
+    res.json(await renewPlan(db, req.user!, idParam(req), body.startDate));
   });
 
   r.get('/:id', async (req, res) => {
@@ -178,6 +258,17 @@ export function membersRouter(db: Db) {
       phone: user.phone,
       devicePin: user.devicePin,
       plan,
+      shifts: await db
+        .select({ id: shiftTemplates.id, name: shiftTemplates.name, startTime: shiftTemplates.startTime, endTime: shiftTemplates.endTime, priceCents: shiftTemplates.priceCents })
+        .from(memberShifts)
+        .innerJoin(shiftTemplates, eq(shiftTemplates.id, memberShifts.shiftId))
+        .where(eq(memberShifts.memberId, member.id))
+        .orderBy(asc(shiftTemplates.startTime))
+        .all(),
+      amenities: await memberAllowance(db, member.id, today),
+      amenityOwedCents: await amenityOwed(db, member.id),
+      moneyEntries: await db.select().from(depositEntries).where(eq(depositEntries.memberId, member.id)).orderBy(asc(depositEntries.occurredAt)).all(),
+      desks: await db.select({ id: resources.id, name: resources.name, kind: resources.kind }).from(memberDesks).innerJoin(resources, eq(resources.id, memberDesks.resourceId)).where(eq(memberDesks.memberId, member.id)).all(),
       assignments: assigned.map(({ assignment, resource }) => ({
         ...assignment,
         resourceName: resource.name,
@@ -202,6 +293,8 @@ export function membersRouter(db: Db) {
           startDate: dateStr,
           endDate: dateStr.nullable(),
           notes: z.string().trim().max(2000),
+          meetingCredits,
+          amenities: freeAmenities,
         })
         .partial(),
       req.body,
@@ -214,7 +307,7 @@ export function membersRouter(db: Db) {
       if (await db.select().from(users).where(eq(users.email, body.email)).get()) throw conflict('That email is already in use');
     }
 
-    const { name, email, phone, ...memberFields } = body;
+    const { name, email, phone, amenities: freeList, ...memberFields } = body;
     // Cancelling someone must not leave a rent running or a security deposit unsettled.
     if (body.status === 'cancelled' && member.status !== 'cancelled') {
       const live = await db.select({ id: contracts.id }).from(contracts).where(and(eq(contracts.memberId, member.id), inArray(contracts.status, ['draft', 'active']))).get();
@@ -235,6 +328,7 @@ export function membersRouter(db: Db) {
           await finishBookingOnCheckOut(tx as unknown as Db, a);
         }
       }
+      if (freeList) await setMemberAmenities(tx as unknown as Db, member.id, member.locationId, freeList);
       const userPatch: Partial<typeof users.$inferInsert> = {};
       if (name !== undefined) userPatch.name = name;
       if (email !== undefined) userPatch.email = email;

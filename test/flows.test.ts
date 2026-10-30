@@ -3,7 +3,7 @@ import { and, eq } from 'drizzle-orm';
 import { attendance, bookings, members, users } from '../src/db/schema.js';
 import { checkInMember } from '../src/services/checkin.js';
 import { addDays, todayIn, zonedToUtc } from '../src/lib/time.js';
-import { inDays, login, setupOpen as setup, TZ } from './helpers.js';
+import { inDays, login, setupOpen as setup, TZ, entitle } from './helpers.js';
 
 const today = todayIn(TZ);
 
@@ -11,6 +11,7 @@ const today = todayIn(TZ);
 describe('flows that cross the front desk, bookings, contracts and members', () => {
   it('lets someone who forgot to check out yesterday check in today, and clears the old visit', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.pro.member.id, today);
     const yesterday = addDays(today, -1);
     await ctx.db.insert(attendance).values({ locationId: ctx.loc.id, memberId: ctx.pro.member.id, resourceId: ctx.desk.id, checkInAt: zonedToUtc(yesterday, '09:00', TZ).toISOString() }).run();
     const staff = await login(ctx.app, 'desk@test.dev');
@@ -24,12 +25,14 @@ describe('flows that cross the front desk, bookings, contracts and members', () 
 
   it('closes an overnight visit when checking in, even if nobody looked at the list', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.pro.member.id, today);
     await ctx.db.insert(attendance).values({ locationId: ctx.loc.id, memberId: ctx.pro.member.id, checkInAt: zonedToUtc(addDays(today, -2), '10:00', TZ).toISOString() }).run();
     expect((await checkInMember(ctx.db, ctx.pro.member, null)).memberId).toBe(ctx.pro.member.id);
   });
 
   it('cancelling a member cancels their coming bookings, checks them out, and keeps what was already invoiced', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.pro.member.id, today);
     const staff = await login(ctx.app, 'manager@test.dev');
     const future = await staff.post('/api/bookings').send({ resourceId: ctx.desk.id, memberId: ctx.pro.member.id, date: inDays(3) }).expect(201);
     const invoiced = await staff.post('/api/bookings').send({ resourceId: ctx.desk.id, memberId: ctx.pro.member.id, date: inDays(4) }).expect(201);
@@ -73,6 +76,8 @@ describe('flows that cross the front desk, bookings, contracts and members', () 
 
   it('keeps a cancelled booking from holding the member to a desk or blocking the desk', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.pro.member.id, today);
+    await entitle(ctx, ctx.basic.member.id, today);
     const staff = await login(ctx.app, 'manager@test.dev');
     const b = await staff.post('/api/bookings').send({ resourceId: ctx.desk.id, memberId: ctx.pro.member.id, date: today }).expect(201);
     await staff.post(`/api/bookings/${b.body.id}/cancel`).expect(200);
@@ -91,6 +96,7 @@ describe('flows that cross the front desk, bookings, contracts and members', () 
 
   it('keeps member accounts of one member from checking others in', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.basic.member.id, today);
     const member = await login(ctx.app, 'basic@test.dev');
     const row = await member.post('/api/attendance/check-in').send({ memberId: ctx.pro.member.id }).expect(201);
     expect(row.body.memberId).toBe(ctx.basic.member.id);

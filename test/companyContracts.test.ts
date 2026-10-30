@@ -70,12 +70,11 @@ describe('company contracts', () => {
     const ctx = await setup();
     const { owner, res } = await acme(ctx);
     await owner.post(`/api/contracts/${res.body.id}/activate`).expect(200);
-    const book = (who: Awaited<ReturnType<typeof login>>, memberId: string) =>
-      who.post('/api/bookings').send({ resourceId: ctx.room.id, memberId, date: inDays(2), startTime: '10:00', endTime: '11:00' });
+    const book = (memberId: string) => owner.post('/api/bookings').send({ resourceId: ctx.room.id, memberId, date: inDays(2), startTime: '10:00', endTime: '11:00' });
     const list = (await owner.get(`/api/contracts?locationId=${ctx.loc.id}`)).body[0];
     const f = list.people.find((p: { email: string }) => p.email === 'f@acme.dev');
-    await book(await login(ctx.app, 'f@acme.dev'), f.memberId).expect(201);
-    await book(await login(ctx.app, 'pro@test.dev'), ctx.pro.member.id).expect(409);
+    await book(f.memberId).expect(201);
+    await book(ctx.pro.member.id).expect(409);
   });
 
   it('gives a person their own free desk, and refuses a desk someone else already holds', async () => {

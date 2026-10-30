@@ -3,9 +3,9 @@ import bcrypt from 'bcryptjs';
 import request from 'supertest';
 import { createApp } from '../src/app.js';
 import { createDb, type Db } from '../src/db/client.js';
-import { locations, members, organizations, packages, plans, resources, userLocations, users } from '../src/db/schema.js';
+import { bookings, locations, members, organizations, packages, plans, resources, userLocations, users } from '../src/db/schema.js';
 import { FEATURE_KEYS } from '../src/features.js';
-import { addDays, todayIn } from '../src/lib/time.js';
+import { addDays, todayIn, zonedToUtc } from '../src/lib/time.js';
 
 export const PASSWORD = 'password123';
 const hash = bcrypt.hashSync(PASSWORD, 4);
@@ -142,4 +142,18 @@ export async function setupOpen() {
   const ctx = await setup();
   await ctx.db.update(locations).set({ openTime: '00:00', closeTime: '23:59' }).where(eq(locations.id, ctx.loc.id)).run();
   return ctx;
+}
+
+let spare = 0;
+/**
+ * Gives a member a reason to be checked in today: a whole-day booking on an office of their own, the way a plan's shift would.
+ * Nobody can check in without one, so tests about other rules use this first. The office is not any of the shared test spaces.
+ */
+export async function entitle(ctx: Ctx, memberId: string, day = todayIn(TZ)) {
+  const office = await ctx.db.insert(resources).values({ locationId: ctx.loc.id, kind: 'office', name: `Spare office ${++spare}` }).returning().get();
+  const by = (await ctx.db.select().from(users).where(eq(users.email, 'owner@test.dev')).get())!;
+  await ctx.db
+    .insert(bookings)
+    .values({ locationId: ctx.loc.id, resourceId: office.id, memberId, startsAt: zonedToUtc(day, '00:00', TZ).toISOString(), endsAt: zonedToUtc(addDays(day, 1), '00:00', TZ).toISOString(), createdById: by.id, source: 'plan' })
+    .run();
 }

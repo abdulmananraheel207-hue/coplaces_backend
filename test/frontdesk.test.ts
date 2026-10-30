@@ -3,11 +3,13 @@ import { addDays, todayIn, zonedToUtc } from '../src/lib/time.js';
 import { eq } from 'drizzle-orm';
 import { users } from '../src/db/schema.js';
 import { createBooking } from '../src/services/bookings.js';
-import { login, setupOpen as setup, TZ, tomorrow } from './helpers.js';
+import { entitle, login, setupOpen as setup, TZ, tomorrow } from './helpers.js';
 
 describe('member check-in', () => {
   it('checks members in and out, once at a time', async () => {
-    const { app, loc, basic } = await setup();
+    const ctx = await setup();
+    const { app, loc, basic } = ctx;
+    await entitle(ctx, basic.member.id);
     const staff = await login(app, 'desk@test.dev');
     const inn = await staff.post('/api/attendance/check-in').send({ memberId: basic.member.id }).expect(201);
     await staff.post('/api/attendance/check-in').send({ memberId: basic.member.id }).expect(409);
@@ -24,7 +26,9 @@ describe('member check-in', () => {
   });
 
   it('lets a member check themselves in but not someone else, and blocks inactive members', async () => {
-    const { app, db, pro, basic } = await setup();
+    const ctx = await setup();
+    const { app, db, pro, basic } = ctx;
+    await entitle(ctx, basic.member.id);
     const agent = await login(app, 'basic@test.dev');
     const row = await agent.post('/api/attendance/check-in').send({ memberId: pro.member.id }).expect(201);
     expect(row.body.memberId).toBe(basic.member.id);
@@ -111,6 +115,7 @@ describe('desk clashes between check-in and bookings', () => {
 
   it('refuses to check a member in at a desk someone else booked today', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.basic.member.id);
     const today = todayIn(TZ);
     await createBooking(ctx.db, { resourceId: ctx.desk.id, memberId: ctx.pro.member.id, date: today, notes: '' }, await staffUser(ctx), nine(today));
     const staff = await login(ctx.app, 'desk@test.dev');
@@ -123,6 +128,8 @@ describe('desk clashes between check-in and bookings', () => {
 
   it('refuses a second member at a desk someone is already sitting at', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.pro.member.id);
+    await entitle(ctx, ctx.basic.member.id);
     const staff = await login(ctx.app, 'desk@test.dev');
     const first = await staff.post('/api/attendance/check-in').send({ memberId: ctx.pro.member.id, resourceId: ctx.desk.id }).expect(201);
     await staff.post('/api/attendance/check-in').send({ memberId: ctx.basic.member.id, resourceId: ctx.desk.id }).expect(409);
@@ -132,6 +139,7 @@ describe('desk clashes between check-in and bookings', () => {
 
   it('refuses to book a desk another member is checked in at, and shows it as in use', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.pro.member.id);
     const today = todayIn(TZ);
     const staff = await login(ctx.app, 'desk@test.dev');
     const inn = await staff.post('/api/attendance/check-in').send({ memberId: ctx.pro.member.id, resourceId: ctx.desk.id }).expect(201);

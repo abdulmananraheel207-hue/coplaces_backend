@@ -214,7 +214,8 @@ async function planBooking(tx: Tx, req: BookingRequest, actor: AuthUser, now: Da
         )
         .all();
       const freeUsed = used.reduce((sum, b) => sum + (minutesBetween(b.startsAt, b.endsAt) - b.billableMinutes), 0);
-      const freeLeft = Math.max(0, (plan?.includedMeetingMinutes ?? 0) - freeUsed);
+      // The plan's minutes plus the credit hours the owner gave this member (two credit hours are an hour).
+      const freeLeft = Math.max(0, (plan?.includedMeetingMinutes ?? 0) + member.meetingCredits * 30 - freeUsed);
       billableMinutes = duration - Math.min(duration, freeLeft);
       // A shift with its own price is charged in full and leaves the included minutes alone. Otherwise only the minutes beyond the allowance are charged, at the booking's own average rate.
       const shift = await matchShift(tx, resource, startTime, endTime, plan?.id ?? null);

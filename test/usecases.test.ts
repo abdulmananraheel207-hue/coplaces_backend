@@ -4,7 +4,7 @@ import { bookings, locations, resources, users } from '../src/db/schema.js';
 import { checkInMember } from '../src/services/checkin.js';
 import { createBooking } from '../src/services/bookings.js';
 import { todayIn, zonedToUtc } from '../src/lib/time.js';
-import { login, setup, TZ, inDays } from './helpers.js';
+import { login, setup, TZ, inDays, entitle } from './helpers.js';
 
 const today = todayIn(TZ);
 const at = (time: string, date = today) => zonedToUtc(date, time, TZ);
@@ -75,6 +75,7 @@ describe('the front desk and bookings agree', () => {
 
   it('does not complete a booking the member never checked in for', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.basic.member.id);
     const b = await book(ctx, ctx.desk.id, ctx.pro.member.id);
     const staff = await login(ctx.app, 'desk@test.dev');
     const inn = await checkInMember(ctx.db, ctx.basic.member, ctx.desk2.id, at('09:30'));
@@ -84,6 +85,7 @@ describe('the front desk and bookings agree', () => {
 
   it('checks a member in at the room they booked, but only around the time they booked it', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.basic.member.id, today);
     await book(ctx, ctx.room.id, ctx.pro.member.id, { startTime: '14:00', endTime: '15:00' });
     await expect(checkInMember(ctx.db, ctx.pro.member, ctx.room.id, at('11:00'))).rejects.toThrow(/from 14:00 to 15:00/);
     await expect(checkInMember(ctx.db, ctx.basic.member, ctx.room.id, at('14:10'))).rejects.toThrow(/not booked by this member/);
@@ -103,12 +105,13 @@ describe('the front desk and bookings agree', () => {
 
   it('refuses check-in on a holiday, on a closed weekday, and outside opening hours', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.pro.member.id, today);
     const owner = await login(ctx.app, 'owner@test.dev');
     await expect(checkInMember(ctx.db, ctx.pro.member, null, at('07:00'))).rejects.toThrow(/open 08:00 to 20:00/);
     await expect(checkInMember(ctx.db, ctx.pro.member, null, at('20:00'))).rejects.toThrow(/open 08:00 to 20:00/);
     const ok = await checkInMember(ctx.db, ctx.pro.member, null, at('08:00'));
     await ctx.db.delete(await import('../src/db/schema.js').then((m) => m.attendance)).run();
-    expect(ok.resourceId).toBeNull();
+    expect(ok.memberId).toBe(ctx.pro.member.id);
 
     await owner.post(`/api/locations/${ctx.loc.id}/holidays`).send({ date: today, name: 'Founders Day' }).expect(201);
     await expect(checkInMember(ctx.db, ctx.pro.member, null, at('10:00'))).rejects.toThrow(/Founders Day/);
@@ -122,6 +125,7 @@ describe('the front desk and bookings agree', () => {
 
   it('lets a member with a space of their own in at any hour', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.basic.member.id, today);
     const staff = await login(ctx.app, 'manager@test.dev');
     const c = await staff.post('/api/contracts').send({ locationId: ctx.loc.id, memberId: ctx.pro.member.id, resourceId: ctx.dedicated.id, startDate: today }).expect(201);
     await staff.post(`/api/contracts/${c.body.id}/activate`).expect(200);
@@ -131,6 +135,7 @@ describe('the front desk and bookings agree', () => {
 
   it('keeps a space that has its own hours to them', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.pro.member.id, today);
     await ctx.db.update(resources).set({ openTime: '10:00', closeTime: '12:00' }).where(eq(resources.id, ctx.desk.id)).run();
     await expect(checkInMember(ctx.db, ctx.pro.member, ctx.desk.id, at('09:00'))).rejects.toThrow(/Desk 1 is open 10:00 to 12:00/);
     expect((await checkInMember(ctx.db, ctx.pro.member, ctx.desk.id, at('10:30'))).resourceId).toBe(ctx.desk.id);
@@ -160,6 +165,7 @@ describe('the front desk and bookings agree', () => {
 
   it('refuses a space rented to another member, whatever its kind', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.basic.member.id, today);
     const staff = await login(ctx.app, 'manager@test.dev');
     const c = await staff.post('/api/contracts').send({ locationId: ctx.loc.id, memberId: ctx.pro.member.id, resourceId: ctx.desk.id, startDate: today }).expect(201);
     await staff.post(`/api/contracts/${c.body.id}/activate`).expect(200);

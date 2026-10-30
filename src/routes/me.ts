@@ -6,6 +6,7 @@ import { loadLocation, loadMember } from '../lib/access.js';
 import { hasFeature } from '../lib/auth.js';
 import { forbidden } from '../lib/errors.js';
 import { dayRange, localDate, minutesBetween, monthRange, todayIn } from '../lib/time.js';
+import { amenityOwed, memberAllowance } from '../services/amenities.js';
 import { withBalance } from '../services/billing.js';
 import { isWholeDay } from '../services/bookings.js';
 
@@ -91,7 +92,9 @@ export function meRouter(db: Db) {
       timezone: loc.timezone,
       today: localDate(now, loc.timezone),
       plan,
-      meetingMinutes: { included: plan?.includedMeetingMinutes ?? 0, used: usedMinutes },
+      meetingMinutes: { included: (plan?.includedMeetingMinutes ?? 0) + member.meetingCredits * 30, used: usedMinutes },
+      amenities: await memberAllowance(db, member.id, today),
+      amenityDueCents: await amenityOwed(db, member.id),
       checkedIn,
       upcomingBookings,
       openInvoices: open,

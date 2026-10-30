@@ -16,6 +16,7 @@ import {
   visitors,
 } from '../db/schema.js';
 import { isHourly } from '../catalogue.js';
+import { amenityFinance } from './amenities.js';
 import { loadLocation } from '../lib/access.js';
 import { addDays, addMonths, daysBetween, dayRange, localDate, monthRange, todayIn, zonedToUtc } from '../lib/time.js';
 
@@ -175,8 +176,8 @@ export async function financeReport(db: Db, p: { locationId: string; from: strin
   const depositMoves = await db
     .select({ e: depositEntries, memberName: users.name, resourceName: resources.name })
     .from(depositEntries)
-    .innerJoin(contracts, eq(contracts.id, depositEntries.contractId))
-    .innerJoin(members, eq(members.id, contracts.memberId))
+    .leftJoin(contracts, eq(contracts.id, depositEntries.contractId))
+    .innerJoin(members, eq(members.id, sql`coalesce(${depositEntries.memberId}, ${contracts.memberId})`))
     .innerJoin(users, eq(users.id, members.userId))
     .leftJoin(resources, eq(resources.id, contracts.resourceId))
     .where(and(eq(depositEntries.locationId, p.locationId), gte(depositEntries.occurredAt, start), lt(depositEntries.occurredAt, end)))
@@ -190,6 +191,8 @@ export async function financeReport(db: Db, p: { locationId: string; from: strin
     .where(and(eq(depositEntries.locationId, p.locationId), eq(depositEntries.kind, kind as 'kept'), lt(depositEntries.occurredAt, now.toISOString())))
     .get())!.v;
   const heldCents = await depositTotal('received') - await depositTotal('refunded') - await depositTotal('kept');
+  // Amenities charged beyond a member's free amount are income when the front desk collects them.
+  const amenity = await amenityFinance(db, p.locationId, start, end);
   const spend = await db
     .select({ amountCents: expenses.amountCents, category: expenses.category, incurredOn: expenses.incurredOn })
     .from(expenses)
@@ -212,7 +215,7 @@ export async function financeReport(db: Db, p: { locationId: string; from: strin
     const row = monthly.get(localDate(x.paidAt, tz).slice(0, 7));
     if (row) row.collectedCents += x.amountCents;
   }
-  for (const x of [...keptDeposits, ...advances]) {
+  for (const x of [...keptDeposits, ...advances, ...amenity.collected]) {
     const row = monthly.get(localDate(x.paidAt, tz).slice(0, 7));
     if (row) row.collectedCents += x.amountCents;
   }
@@ -234,7 +237,8 @@ export async function financeReport(db: Db, p: { locationId: string; from: strin
 
   const keptCents = keptDeposits.reduce((s, x) => s + x.amountCents, 0);
   const advanceCents = advances.reduce((s, x) => s + x.amountCents, 0);
-  const collectedCents = pays.reduce((s, x) => s + x.amountCents, 0) + keptCents + advanceCents;
+  const amenityCents = amenity.collected.reduce((s, x) => s + x.amountCents, 0);
+  const collectedCents = pays.reduce((s, x) => s + x.amountCents, 0) + keptCents + advanceCents + amenityCents;
   const expensesCents = spend.reduce((s, x) => s + x.amountCents, 0);
 
   const openInvoices = await db
@@ -266,6 +270,7 @@ export async function financeReport(db: Db, p: { locationId: string; from: strin
     .from(depositEntries)
     .where(and(eq(depositEntries.locationId, p.locationId), inArray(depositEntries.kind, ['kept', 'advance']), gte(depositEntries.occurredAt, prevStart), lt(depositEntries.occurredAt, prevEnd)))
     .get())!.v;
+  const prevAmenities = (await amenityFinance(db, p.locationId, prevStart, prevEnd)).collected.reduce((t, x) => t + x.amountCents, 0);
   const prevExpenses = (await db
     .select({ v: sumOf(expenses.amountCents) })
     .from(expenses)
@@ -281,6 +286,7 @@ export async function financeReport(db: Db, p: { locationId: string; from: strin
     ['manual', blank()],
     ['kept_deposit', blank()],
     ['advance', blank()],
+    ['amenities', blank()],
   ]);
   for (const x of pays) {
     const i = monthIndex.get(localDate(x.paidAt, tz).slice(0, 7));
@@ -293,6 +299,10 @@ export async function financeReport(db: Db, p: { locationId: string; from: strin
   for (const x of advances) {
     const i = monthIndex.get(localDate(x.paidAt, tz).slice(0, 7));
     if (i !== undefined) incomeRows.get('advance')![i]! += x.amountCents;
+  }
+  for (const x of amenity.collected) {
+    const i = monthIndex.get(localDate(x.paidAt, tz).slice(0, 7));
+    if (i !== undefined) incomeRows.get('amenities')![i]! += x.amountCents;
   }
   const costRows = new Map<string, number[]>();
   for (const x of spend) {
@@ -310,9 +320,9 @@ export async function financeReport(db: Db, p: { locationId: string; from: strin
     previous: {
       from: prevFrom,
       to: prevTo,
-      collectedCents: prevCollected + prevKept,
+      collectedCents: prevCollected + prevKept + prevAmenities,
       expensesCents: prevExpenses,
-      netCents: prevCollected + prevKept - prevExpenses,
+      netCents: prevCollected + prevKept + prevAmenities - prevExpenses,
     },
     incomeByKind: [...incomeRows.entries()].map(([kind, by]) => ({ kind, amountCents: rowTotal(by) })),
     profitLoss: {
@@ -332,6 +342,7 @@ export async function financeReport(db: Db, p: { locationId: string; from: strin
     expensesByCategory: group(spend, (r: { category: string }) => r.category).map(({ key, amountCents }) => ({ category: key, amountCents })),
     paymentsByMethod: group(pays, (r: { method: string }) => r.method).map(({ key, amountCents }) => ({ method: key, amountCents })),
     receivablesAging: aging,
+    amenities: { owedCents: amenity.owedRows.reduce((s, x) => s + x.owedCents, 0), collectedCents: amenityCents, owedBy: amenity.owedRows },
     deposits: {
       heldCents,
       receivedCents: depositMoves.filter((x) => x.e.kind === 'received').reduce((s, x) => s + x.e.amountCents, 0),

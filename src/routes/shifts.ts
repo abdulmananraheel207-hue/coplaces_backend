@@ -11,8 +11,8 @@ import { requirePermission } from '../lib/permissions.js';
 import { TIME_RE, toMinutes } from '../lib/time.js';
 import { parse } from '../lib/validate.js';
 
-/** Only spaces that are booked can have shifts. */
-const BOOKABLE = ['room', 'corporate_room', 'hot_desk'] as const;
+/** Rooms, desks and offices can have shifts. Lockers and parking cannot. */
+const BOOKABLE = ['room', 'corporate_room', 'hot_desk', 'dedicated_desk', 'office'] as const;
 
 const timeStr = z.string().regex(TIME_RE, 'Use HH:mm');
 const fields = z.object({
@@ -37,7 +37,7 @@ async function check(db: Db, locationId: string, v: { planId: string | null; spa
   if (v.spaceIds.length) {
     const rows = await db.select().from(resources).where(inArray(resources.id, v.spaceIds)).all();
     if (rows.length !== new Set(v.spaceIds).size || rows.some((r) => r.locationId !== locationId)) throw notFound('Space');
-    if (rows.some((r) => !(BOOKABLE as readonly string[]).includes(r.kind))) throw badRequest('Only rooms and hot desks can have shifts');
+    if (rows.some((r) => !(BOOKABLE as readonly string[]).includes(r.kind))) throw badRequest('Only rooms, desks and offices can have shifts');
   }
 }
 

@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { bookings } from '../src/db/schema.js';
 import { addDays, todayIn, zonedToUtc } from '../src/lib/time.js';
-import { login, setupOpen as setup, TZ, tomorrow } from './helpers.js';
+import { login, setupOpen as setup, TZ, tomorrow, entitle } from './helpers.js';
 
 describe('dashboard and finance reports', () => {
   it('summarises operations for the front desk without finance figures', async () => {
-    const { app, db, loc, room, desk, basic, pro } = await setup();
+    const ctx = await setup();
+    const { app, db, loc, room, desk, basic, pro } = ctx;
     const staff = await login(app, 'desk@test.dev');
+    await entitle(ctx, basic.member.id);
     await staff.post('/api/attendance/check-in').send({ memberId: basic.member.id }).expect(201);
     await staff.post('/api/visitors').send({ name: 'V', hostMemberId: pro.member.id, expectedDate: todayIn(TZ), expectedTime: '23:00' }).expect(201);
     // A desk booked for today. It is inserted directly because the booking rules (rightly) refuse a day that
@@ -27,7 +29,7 @@ describe('dashboard and finance reports', () => {
     expect(d.ops.visitorsExpectedToday).toBe(1);
     expect(d.ops.hotDesks).toEqual({ total: 2, bookedToday: 1 });
     expect(d.ops.dedicatedDesks.total).toBe(1);
-    expect(d.ops.bookingsToday).toBe(1);
+    expect(d.ops.bookingsToday).toBe(2); // the desk booking, and the shift booking that lets the checked-in member be here
   });
 
   it('computes revenue, expenses, net and receivables aging for managers', async () => {

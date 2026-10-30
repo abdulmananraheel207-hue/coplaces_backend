@@ -3,7 +3,7 @@ import request from 'supertest';
 import { eq } from 'drizzle-orm';
 import { attendance, deviceCommands, devicePunches, devices, staffAttendance, users } from '../src/db/schema.js';
 import { deviceTimeToUtc, parseAttlog, parseCommandResults } from '../src/services/devices.js';
-import { login, setupOpen as setup, TZ } from './helpers.js';
+import { login, setupOpen as setup, TZ, entitle } from './helpers.js';
 
 const SN = 'CQZ7224460001';
 
@@ -88,6 +88,7 @@ describe('attendance device protocol', () => {
 
   it('checks a member in and out by fingerprint, and ignores repeats and resends', async () => {
     const ctx = await withDevice();
+    await entitle(ctx as never, ctx.pro.member.id);
     const pin = await ctx.pinOf('pro@test.dev');
     const batch = [punchLine(pin, -10), punchLine(pin, -9.5), punchLine(pin, -5)];
     expect((await ctx.push(batch).expect(200)).text).toBe('OK: 3');

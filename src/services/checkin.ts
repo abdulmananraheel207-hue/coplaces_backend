@@ -1,6 +1,6 @@
 import { and, eq, gte, inArray, isNull, lt, lte, ne, or } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
-import { attendance, bookings, resourceAssignments, resources, users, members } from '../db/schema.js';
+import { attendance, bookings, memberShifts, resourceAssignments, resources, users, members } from '../db/schema.js';
 import { loadLocation } from '../lib/access.js';
 import { badRequest, conflict } from '../lib/errors.js';
 import { dayRange, localDate, localTime, toMinutes, todayIn, zonedToUtc } from '../lib/time.js';
@@ -31,6 +31,22 @@ export async function closeStaleVisits(db: Db, locationId: string, now = new Dat
     await db.update(attendance).set({ checkOutAt: left }).where(eq(attendance.id, a.id)).run();
     await finishBookingOnCheckOut(db, a, new Date(a.checkInAt));
   }
+}
+
+/** Why someone cannot check in right now, in words for the front desk. */
+async function whyNotNow(t: Db, memberId: string, mine: { b: { startsAt: string; endsAt: string }; kind: string; name: string }[], nowMs: number, tz: string, today: string) {
+  const places = mine.filter((x) => PLACES.includes(x.kind)).sort((a, b) => a.b.startsAt.localeCompare(b.b.startsAt));
+  const span = (x: (typeof places)[number]) => `from ${localTime(x.b.startsAt, tz)} to ${localTime(x.b.endsAt, tz)}`;
+  const next = places.find((x) => Date.parse(x.b.startsAt) - EARLY * 60_000 > nowMs);
+  if (next) return `Their next booking today is ${next.name} ${span(next)}. They can check in from ${localTime(new Date(Date.parse(next.b.startsAt) - EARLY * 60_000), tz)}.`;
+  if (places.length) return `Their booking for ${places[places.length - 1]!.name} was ${span(places[places.length - 1]!)}, so they cannot check in now.`;
+  const m = await t.select().from(members).where(eq(members.id, memberId)).get();
+  if (m?.planEnd && m.planEnd < today) return `Their plan ended on ${m.planEnd}. Renew it before they can check in.`;
+  if (m?.planId) {
+    const shift = await t.select({ id: memberShifts.shiftId }).from(memberShifts).where(eq(memberShifts.memberId, memberId)).get();
+    return shift ? 'They have no booking today, so their shifts do not run on this day.' : 'They have a plan but no shifts, so they cannot check in. Give them shifts first.';
+  }
+  return 'This member has no plan, shifts or booking, so they cannot check in. Give them a plan with shifts first.';
 }
 
 /**
@@ -64,12 +80,15 @@ export async function checkInMember(db: Db, member: { id: string; locationId: st
       .where(and(eq(bookings.memberId, member.id), inArray(bookings.status, [...LIVE]), lt(bookings.startsAt, day.end), gte(bookings.endsAt, day.start)))
       .all();
     const rented = await tx
-      .select({ id: resourceAssignments.id })
+      .select({ id: resourceAssignments.id, resourceId: resourceAssignments.resourceId })
       .from(resourceAssignments)
       .where(and(eq(resourceAssignments.memberId, member.id), lte(resourceAssignments.startDate, todayDate), or(isNull(resourceAssignments.endDate), gte(resourceAssignments.endDate, todayDate))))
       .all();
     // A hot desk can be booked for part of a day, so someone may hold several. The one that matters is the one running now, or else the next to start.
     const nowMs = now.getTime();
+    // Nobody checks in without a reason to be here: a booking that is running now (a plan's shift is one), or a space rented to them.
+    const running = mine.filter((x) => PLACES.includes(x.kind) && nowMs >= Date.parse(x.b.startsAt) - EARLY * 60_000 && nowMs < Date.parse(x.b.endsAt));
+    if (!running.length && !rented.length) throw conflict(await whyNotNow(t, member.id, mine, nowMs, tz, todayDate));
     const deskBookings = mine.filter((x) => x.kind === 'hot_desk').sort((a, b) => a.b.startsAt.localeCompare(b.b.startsAt));
     const deskBooking = deskBookings.find((x) => nowMs >= Date.parse(x.b.startsAt) - EARLY * 60_000 && nowMs < Date.parse(x.b.endsAt)) ?? deskBookings.find((x) => Date.parse(x.b.endsAt) > nowMs) ?? deskBookings[0];
     const bookedDeskIds = new Set(deskBookings.map((x) => x.b.resourceId));
@@ -79,8 +98,14 @@ export async function checkInMember(db: Db, member: { id: string; locationId: st
       if (!target || target.locationId !== member.locationId) throw badRequest('Unknown space for this location');
       if (!PLACES.includes(target.kind)) throw badRequest(`${target.name} is not somewhere to check in`);
       if (target.status === 'retired') throw conflict(`${target.name} has been retired`);
-    } else if (deskBooking) {
-      target = await tx.select().from(resources).where(eq(resources.id, deskBooking.b.resourceId)).get();
+    } else {
+      // The space follows from why they are here: the desk or office of the shift running now, else a room they booked, else the desk they rent.
+      const pick = [...running].sort((a, b) => Number(isHourly(a.kind)) - Number(isHourly(b.kind)) || a.b.startsAt.localeCompare(b.b.startsAt))[0];
+      if (pick) target = await tx.select().from(resources).where(eq(resources.id, pick.b.resourceId)).get();
+      else {
+        const own = rented.length ? await tx.select().from(resources).where(inArray(resources.id, rented.map((r) => r.resourceId))).all() : [];
+        target = own.find((r) => PLACES.includes(r.kind) && !isHourly(r.kind) && r.status === 'available');
+      }
     }
 
     const here = target ? mine.filter((x) => x.b.resourceId === target!.id).sort((a, b) => a.b.startsAt.localeCompare(b.b.startsAt)) : [];

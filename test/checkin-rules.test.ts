@@ -3,7 +3,7 @@ import { eq } from 'drizzle-orm';
 import { resourceAssignments, resources, users } from '../src/db/schema.js';
 import { createBooking, cancelBooking } from '../src/services/bookings.js';
 import { todayIn, zonedToUtc } from '../src/lib/time.js';
-import { login, setupOpen as setup, TZ, tomorrow } from './helpers.js';
+import { entitle, login, setupOpen as setup, TZ, tomorrow } from './helpers.js';
 
 const nine = (d: string) => zonedToUtc(d, '09:00', TZ);
 const staffUser = async (ctx: Awaited<ReturnType<typeof setup>>) => {
@@ -36,6 +36,8 @@ describe('front desk check-in matches the member\'s bookings', () => {
 
   it('is not held to a desk booked for another day, a cancelled booking, or a room booking', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.pro.member.id);
+    await entitle(ctx, ctx.basic.member.id);
     const staff = await login(ctx.app, 'desk@test.dev');
     await book(ctx, ctx.desk.id, ctx.pro.member.id, tomorrow());
     const cancelled = await book(ctx, ctx.desk2.id, ctx.basic.member.id);
@@ -47,10 +49,11 @@ describe('front desk check-in matches the member\'s bookings', () => {
 
   it('keeps a booked room from changing anything', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.pro.member.id);
     const staff = await login(ctx.app, 'desk@test.dev');
     await createBooking(ctx.db, { resourceId: ctx.room.id, memberId: ctx.pro.member.id, date: todayIn(TZ), startTime: '14:00', endTime: '15:00', notes: '' }, await staffUser(ctx), nine(todayIn(TZ)));
     const r = await checkIn(staff, ctx.pro.member.id, null).expect(201);
-    expect(r.body.resourceId).toBeNull();
+    expect(r.body.resourceId).not.toBe(ctx.room.id); // the room is not where they are sent
   });
 
   it('still holds the member to the booked desk after they check out and come back', async () => {
@@ -85,6 +88,7 @@ describe('check-in only at spaces that can be sat at', () => {
 
   it('refuses a dedicated desk that belongs to someone else, and allows its owner', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.basic.member.id);
     const staff = await login(ctx.app, 'desk@test.dev');
     await ctx.db.insert(resourceAssignments).values({ resourceId: ctx.dedicated.id, memberId: ctx.pro.member.id, startDate: todayIn(TZ) }).run();
     const r = await checkIn(staff, ctx.basic.member.id, ctx.dedicated.id).expect(409);
@@ -94,6 +98,7 @@ describe('check-in only at spaces that can be sat at', () => {
 
   it('allows an unassigned dedicated desk, and one whose assignment has ended', async () => {
     const ctx = await setup();
+    await entitle(ctx, ctx.basic.member.id);
     const staff = await login(ctx.app, 'desk@test.dev');
     await ctx.db.insert(resourceAssignments).values({ resourceId: ctx.dedicated.id, memberId: ctx.pro.member.id, startDate: '2020-01-01', endDate: '2020-02-01' }).run();
     await checkIn(staff, ctx.basic.member.id, ctx.dedicated.id).expect(201);

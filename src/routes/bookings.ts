@@ -6,7 +6,8 @@ import { BOOKING_STATUSES, attendance, bookings, members, resources, users } fro
 import { loadLocation, requireLocationId } from '../lib/access.js';
 import { assertLocation, isStaff } from '../lib/auth.js';
 import { assertCan, requirePermission } from '../lib/permissions.js';
-import { badRequest, notFound } from '../lib/errors.js';
+import { badRequest, forbidden, notFound } from '../lib/errors.js';
+import { isHourly } from '../catalogue.js';
 import { idParam, queryString } from '../lib/http.js';
 import { addDays, dayRange, isValidDate, TIME_RE, todayIn, zonedToUtc } from '../lib/time.js';
 import { byName } from '../lib/sort.js';
@@ -15,6 +16,11 @@ import { cancelBooking, closedReason, createBooking, isWholeDay as wholeDay, quo
 
 const dateStr = z.string().refine(isValidDate, 'Use YYYY-MM-DD');
 const timeStr = z.string().regex(TIME_RE, 'Use HH:mm');
+
+async function assertRoomOnly(db: Db, resourceId: string) {
+  const r = await db.select({ kind: resources.kind }).from(resources).where(eq(resources.id, resourceId)).get();
+  if (r && !isHourly(r.kind)) throw forbidden('Desks and offices come with a plan, so members cannot book them');
+}
 
 export function bookingsRouter(db: Db) {
   const r = Router();
@@ -155,6 +161,8 @@ export function bookingsRouter(db: Db) {
     if (isStaff(user)) assertCan(user, 'bookings');
     const memberId = isStaff(user) ? body.memberId : user.memberId;
     if (!memberId) throw badRequest('memberId is required');
+    // A member can see what a room would cost, so they know what they are asking for. Desks and offices come with their plan.
+    if (!isStaff(user)) await assertRoomOnly(db, body.resourceId);
     res.json(await quoteBooking(db, { ...body, memberId }, user));
   });
 
@@ -172,7 +180,9 @@ export function bookingsRouter(db: Db) {
     );
     const user = req.user!;
     if (isStaff(user)) assertCan(user, 'bookings');
-    const memberId = isStaff(user) ? body.memberId : user.memberId;
+    // Members do not book anything themselves any more: rooms are asked for (see requests), desks and offices come with a plan.
+    if (!isStaff(user)) throw forbidden('Members ask the owner for a room instead. Use Request a room on the Book page.');
+    const memberId = body.memberId;
     if (!memberId) throw badRequest('memberId is required');
     res.status(201).json(await createBooking(db, { ...body, memberId }, user));
   });

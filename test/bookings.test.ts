@@ -84,13 +84,18 @@ describe('room bookings', () => {
     await desk.post('/api/bookings').send(body).expect(201);
   });
 
-  it('forces members to book for themselves and hides other members on the schedule', async () => {
-    const { app, loc, room, pro, basic } = await setup();
+  it('stops members booking anything themselves, and hides other members on the schedule', async () => {
+    const { app, loc, room, desk, basic } = await setup();
     const agent = await login(app, 'basic@test.dev');
-    const b = await agent
-      .post('/api/bookings')
-      .send({ resourceId: room.id, memberId: pro.member.id, date: tomorrow(), startTime: '10:00', endTime: '11:00' })
-      .expect(201);
+    // Rooms are asked for, desks and offices come with a plan: a member books neither directly.
+    await agent.post('/api/bookings').send({ resourceId: room.id, date: tomorrow(), startTime: '10:00', endTime: '11:00' }).expect(403);
+    await agent.post('/api/bookings').send({ resourceId: desk.id, date: tomorrow() }).expect(403);
+    // They may see what a room would cost, but not a desk's.
+    await agent.post('/api/bookings/quote').send({ resourceId: room.id, date: tomorrow(), startTime: '10:00', endTime: '11:00' }).expect(200);
+    await agent.post('/api/bookings/quote').send({ resourceId: desk.id, date: tomorrow() }).expect(403);
+
+    const staff = await login(app, 'desk@test.dev');
+    const b = await staff.post('/api/bookings').send({ resourceId: room.id, memberId: basic.member.id, date: tomorrow(), startTime: '10:00', endTime: '11:00' }).expect(201);
     expect(b.body.memberId).toBe(basic.member.id);
 
     const other = await login(app, 'pro@test.dev');
@@ -99,11 +104,11 @@ describe('room bookings', () => {
     expect(sched.body.bookings[0].memberName).toBeUndefined();
     expect(sched.body.bookings[0].mine).toBe(false);
 
-    const staff = await login(app, 'desk@test.dev');
     const staffSched = await staff.get(`/api/bookings/schedule?locationId=${loc.id}&date=${tomorrow()}`).expect(200);
     expect(staffSched.body.bookings[0].memberName).toBe('basic');
 
     await other.post(`/api/bookings/${b.body.id}/cancel`).expect(403);
+    await agent.post(`/api/bookings/${b.body.id}/cancel`).expect(200); // they can still cancel their own
   });
 
   it('refuses to cancel an invoiced booking', async () => {

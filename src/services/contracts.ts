@@ -1,7 +1,6 @@
 import { and, eq, gt, gte, inArray, isNull, lt, lte, ne, or } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import { bookings, contracts, resourceAssignments, resources } from '../db/schema.js';
-import { isAssigned } from '../catalogue.js';
 import { loadLocation, loadMember } from '../lib/access.js';
 import { assertLocation, type AuthUser } from '../lib/auth.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
@@ -20,8 +19,8 @@ export async function assignSpace(db: Db, actor: AuthUser, body: { resourceId: s
   if (member.status !== 'active') throw badRequest('Only active members can be assigned a space');
   if (body.endDate && body.endDate < body.startDate) throw badRequest('End date is before start date');
 
-  // A room or hot desk that is normally booked can still be rented to one member, as long as nobody else has it booked in that time.
-  if (!isAssigned(resource.kind)) {
+  // A space can be rented to one member only if nobody else has it booked in that time (plans book desks and offices too).
+  {
     const tz = (await loadLocation(db, resource.locationId)).timezone;
     const from = zonedToUtc(body.startDate, '00:00', tz).toISOString();
     const clash = await db

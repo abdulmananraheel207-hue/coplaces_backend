@@ -10,7 +10,6 @@ import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { idParam, queryString } from '../lib/http.js';
 import { isValidDate } from '../lib/time.js';
 import { parse } from '../lib/validate.js';
-import { isAssigned } from '../catalogue.js';
 import { addPerson, createCompanyContract, discardCompanyDraft, extendContract, refreshRent, removePerson, setContractSpaces } from '../services/companyContracts.js';
 import { monthCharges, monthlyTotal } from '../services/contractPricing.js';
 import { activateContract, endContract } from '../services/contracts.js';
@@ -147,7 +146,7 @@ export function contractsRouter(db: Db) {
       .all();
     res.json(
       rows.map((x) => {
-        const busy = taken.some((t) => t.resourceId === x.id) ? 'Already rented in that time' : !isAssigned(x.kind) && booked.some((b) => b.resourceId === x.id) ? 'Has bookings in that time' : null;
+        const busy = taken.some((t) => t.resourceId === x.id) ? 'Already rented in that time' : booked.some((b) => b.resourceId === x.id) ? 'Has bookings in that time' : null;
         return { id: x.id, name: x.name, kind: x.kind, floor: x.floor, capacity: x.capacity, free: !busy, busy };
       }),
     );

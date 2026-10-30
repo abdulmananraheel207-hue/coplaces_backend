@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { PERMISSION_KEYS } from '../src/lib/permissions.js';
-import { login, setupOpen as setup, tomorrow } from './helpers.js';
+import { login, setupOpen as setup, tomorrow, entitle } from './helpers.js';
 
 /** An owner makes a team member with exactly these permissions and signs in as them. */
 async function teamMember(ctx: Awaited<ReturnType<typeof setup>>, permissions: string[], email = 'tm@test.dev') {
@@ -44,6 +44,7 @@ describe('team permissions', () => {
   it('lets someone with only the front desk permission check people in, but not edit members', async () => {
     const ctx = await setup();
     const { agent } = await teamMember(ctx, ['front_desk']);
+    await entitle(ctx, ctx.pro.member.id);
     await agent.get(`/api/members?locationId=${ctx.loc.id}`).expect(200); // needed to pick who is arriving
     await agent.post('/api/attendance/check-in').send({ memberId: ctx.pro.member.id }).expect(201);
     await agent.post('/api/members').send({ locationId: ctx.loc.id, name: 'N', email: 'n@test.dev' }).expect(403);
