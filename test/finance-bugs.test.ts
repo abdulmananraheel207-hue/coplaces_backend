@@ -33,7 +33,7 @@ import {
 const knownBug = process.env.SHOW_BUGS ? it : it.fails;
 
 describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
-  knownBug('H1: a company contract advance is taken off the company invoices', async () => {
+  it('H1: a company contract advance is taken off the company invoices', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     const month = monthFromNow(-2);
@@ -48,7 +48,7 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect(sum(company[0]!.items.filter((l) => l.amountCents < 0).map((l) => l.amountCents))).toBe(-1_000_000);
   });
 
-  knownBug('H2: a single-member contract bills its rent every month and uses its advance', async () => {
+  it('H2: a single-member contract bills its rent every month and uses its advance', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     const month = monthFromNow(-2);
@@ -70,7 +70,7 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect(sum(bills[0]!.items.filter((l) => l.amountCents < 0).map((l) => l.amountCents))).toBe(-300_000);
   });
 
-  knownBug('H3: a legacy-plan member’s advance comes off their monthly invoice', async () => {
+  it('H3: a legacy-plan member’s advance comes off their monthly invoice', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     // basic is on the Basic plan (5,000 a month, no shifts, so no plan period): the monthly invoice bills the plan price.
@@ -83,7 +83,7 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect(bill.totalCents).toBe(0); // paid in advance, so nothing more is owed
   });
 
-  knownBug('H4: generating a month again after the company contact changed does not bill the company twice', async () => {
+  it('H4: generating a month again after the company contact changed does not bill the company twice', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     const month = monthFromNow(-2);
@@ -161,7 +161,7 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect((await ctx.db.select().from(memberShifts).where(eq(memberShifts.memberId, mem.id)).all()).map((s) => s.shiftId)).toEqual([p.morning.id]);
   });
 
-  knownBug('M1: cancelled and paused members’ completed bookings and amenities still get billed', async () => {
+  it('M1: cancelled and paused members’ completed bookings and amenities still get billed', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     const month = monthFromNow(-2);

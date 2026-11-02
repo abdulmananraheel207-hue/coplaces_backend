@@ -11,7 +11,6 @@ const knownBug = process.env.SHOW_BUGS ? it : it.fails;
 
 /** The bugs the scenario's checks are tagged with. Adding a tagged check without listing its bug here fails the first test. */
 const BUGS: Record<string, string> = {
-  H1: 'a company contract advance is taken off the company invoices',
   L3: 'payments by method reconcile with money collected',
   R1: 'invoiced includes the part of a bill an advance paid',
   R2: 'tax is reported and kept out of profit and loss income',

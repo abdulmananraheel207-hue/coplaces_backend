@@ -1,4 +1,4 @@
-import { and, desc, eq, lt, sql } from 'drizzle-orm';
+import { and, desc, eq, isNull } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import { depositEntries, invoiceItems, invoices, locations, members, PAYMENT_METHODS } from '../db/schema.js';
 import { loadMember } from '../lib/access.js';
@@ -6,7 +6,7 @@ import { assertLocation, assertSees, type AuthUser } from '../lib/auth.js';
 import { badRequest, conflict } from '../lib/errors.js';
 import { addDays, daysBetween, todayIn } from '../lib/time.js';
 import { loadLocation } from '../lib/access.js';
-import { calcTotals } from './billing.js';
+import { creditOpenInvoice } from './billing.js';
 import { audit } from './audit.js';
 
 /**
@@ -36,25 +36,32 @@ async function entry(t: Db, actor: AuthUser, member: { id: string; locationId: s
   await audit(t, { organizationId: actor.organizationId, locationId: member.locationId, actorId: actor.id, action: ACTIONS[kind], entity: 'member', entityId: member.id, amountCents, data: { method, reference } });
 }
 
-/** Takes what is left of a member's advance off an invoice that is still open and unpaid. */
+/**
+ * Takes what is left of a member's advance off their newest invoice that is still open and unpaid: the invoice of the current plan
+ * period for a member with shifts, otherwise their newest monthly invoice. The invoice keeps the tax rate it was issued at.
+ */
 async function applyToOpenInvoice(t: Db, memberId: string) {
   const m = (await t.select().from(members).where(eq(members.id, memberId)).get())!;
   const left = m.advanceCents - m.advanceUsedCents;
-  if (left <= 0 || !m.planStart) return;
+  if (left <= 0) return;
   const inv = await t
     .select()
     .from(invoices)
-    .where(and(eq(invoices.memberId, memberId), eq(invoices.kind, 'subscription'), eq(invoices.periodStart, m.planStart), eq(invoices.status, 'open'), eq(invoices.paidCents, 0)))
+    .where(
+      and(
+        eq(invoices.memberId, memberId),
+        eq(invoices.kind, 'subscription'),
+        isNull(invoices.contractId),
+        m.planStart ? eq(invoices.periodStart, m.planStart) : undefined,
+        eq(invoices.status, 'open'),
+        eq(invoices.paidCents, 0),
+      ),
+    )
     .orderBy(desc(invoices.createdAt))
     .get();
-  if (!inv || inv.subtotalCents <= 0) return;
-  const credit = Math.min(left, inv.subtotalCents);
-  const loc = (await t.select().from(locations).where(eq(locations.id, inv.locationId)).get())!;
-  // The invoice keeps the tax rate it was issued at, even if the location's rate has changed since.
-  const totals = calcTotals([{ description: '', quantity: 1, unitPriceCents: inv.subtotalCents - credit }], inv.taxRateBps ?? loc.taxRateBps);
-  await t.insert(invoiceItems).values({ invoiceId: inv.id, description: 'Advance paid', quantity: 1, unitPriceCents: -credit, amountCents: -credit, category: 'advance' }).run();
-  await t.update(invoices).set({ ...totals, status: totals.totalCents === 0 ? 'paid' : 'open' }).where(eq(invoices.id, inv.id)).run();
-  await t.update(members).set({ advanceUsedCents: m.advanceUsedCents + credit }).where(eq(members.id, memberId)).run();
+  if (!inv) return;
+  const took = await creditOpenInvoice(t, inv, { description: 'Advance paid', category: 'advance' }, left);
+  if (took > 0) await t.update(members).set({ advanceUsedCents: m.advanceUsedCents + took }).where(eq(members.id, memberId)).run();
 }
 
 /** Records an advance and/or a security deposit as received now. Each can be taken once; the advance is taken off the period's open invoice. */
@@ -75,16 +82,6 @@ export async function recordMemberMoney(t: Db, actor: AuthUser, memberId: string
     await t.update(members).set({ depositCents: deposit, depositStatus: 'held' }).where(eq(members.id, member.id)).run();
   }
   if (advance > 0) await applyToOpenInvoice(t, member.id);
-}
-
-/** What is left of the advance, to take off the next invoice, and the line that does it. Updates how much has been used. */
-export async function advanceCredit(t: Db, memberId: string, grossCents: number) {
-  const m = await t.select().from(members).where(eq(members.id, memberId)).get();
-  const left = m ? m.advanceCents - m.advanceUsedCents : 0;
-  const credit = Math.min(Math.max(left, 0), grossCents);
-  if (credit <= 0 || !m) return null;
-  await t.update(members).set({ advanceUsedCents: m.advanceUsedCents + credit }).where(eq(members.id, memberId)).run();
-  return { description: 'Advance paid', quantity: 1, unitPriceCents: -credit, category: 'advance' as const };
 }
 
 /**

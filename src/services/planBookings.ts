@@ -3,10 +3,9 @@ import type { Db } from '../db/client.js';
 import { bookings, invoices, locationHolidays, memberDesks, memberShifts, members, plans, resourceAssignments, resources, shiftSpaces, shiftTemplates } from '../db/schema.js';
 import { loadLocation } from '../lib/access.js';
 import { assertLocation, assertSees, type AuthUser } from '../lib/auth.js';
-import { advanceCredit } from './memberMoney.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { addDays, addMonthsToDate, businessDateOf, daysBetween, localDate, localTime, shiftWindow, spanMinutes, toMinutes, todayIn, zonedToUtc } from '../lib/time.js';
-import { createInvoice, voidInvoice, type LineItem } from './billing.js';
+import { createInvoice, takeMemberCredits, voidInvoice, type LineItem } from './billing.js';
 import { closedReason, weekdayOf } from './bookings.js';
 
 /**
@@ -152,14 +151,13 @@ async function bookPeriod(t: Db, actor: AuthUser, memberId: string, plan: Plan, 
 }
 
 const itemsFor = (plan: Plan, shifts: Shift[], start: string, end: string): LineItem[] =>
-  shifts.filter((s) => (s.priceCents ?? 0) > 0).map((s) => ({ description: `${plan.name}: ${s.name} ${s.startTime}–${s.endTime}, ${start} to ${end}`, quantity: 1, unitPriceCents: s.priceCents! }));
+  shifts.filter((s) => (s.priceCents ?? 0) > 0).map((s) => ({ description: `${plan.name}: ${s.name} ${s.startTime}–${s.endTime}, ${start} to ${end}`, quantity: 1, unitPriceCents: s.priceCents!, category: 'plan' as const, planId: plan.id }));
 
 async function invoiceItems(t: Db, locationId: string, memberId: string, items: LineItem[], start: string, tz: string) {
   if (!items.length) return null;
   const today = todayIn(tz);
-  // What the member paid in advance comes off the shift prices, until it is used up.
-  const credit = await advanceCredit(t, memberId, items.reduce((s, i) => s + i.quantity * i.unitPriceCents, 0));
-  if (credit) items = [...items, credit];
+  // What the member paid in advance (and any credit from a paid period they did not use) comes off the shift prices, until used up.
+  items = [...items, ...(await takeMemberCredits(t, memberId, items.reduce((s, i) => s + i.quantity * i.unitPriceCents, 0)))];
   return createInvoice(t, { locationId, memberId, kind: 'subscription', issueDate: today, dueDate: addDays(today, 7), periodStart: start, items });
 }
 

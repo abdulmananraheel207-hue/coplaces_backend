@@ -188,13 +188,13 @@ export function depositsHeldAsOf(ledger: LedgerRow[], day: string, tz: string) {
   return k('received') - k('refunded') - k('kept');
 }
 
-/**
- * Advances received but not yet taken off any invoice. Members track what invoices used; a contract's advance is never applied today
- * (H1, H2), so all of it counts. No endpoint reports this today.
- */
-export function advancesUnappliedCents(input: { members: { advanceCents: number; advanceUsedCents: number }[]; contracts: { advanceCents: number; advanceReceivedAt: string | null }[] }) {
-  return sum(input.members.map((m) => Math.max(0, m.advanceCents - m.advanceUsedCents))) + sum(input.contracts.filter((c) => c.advanceReceivedAt).map((c) => c.advanceCents));
+/** Advances received but not yet taken off any invoice: members' and contracts' (each tracks what its invoices used). */
+export function advancesUnappliedCents(input: { members: { advanceCents: number; advanceUsedCents: number }[]; contracts: { advanceCents: number; advanceUsedCents: number; advanceReceivedAt: string | null }[] }) {
+  return sum(input.members.map((m) => Math.max(0, m.advanceCents - m.advanceUsedCents))) + sum(input.contracts.filter((c) => c.advanceReceivedAt).map((c) => Math.max(0, c.advanceCents - c.advanceUsedCents)));
 }
+
+/** Credit members have from paid periods they did not use, not yet taken off an invoice. */
+export const creditsUnappliedCents = (members: { creditCents: number; creditUsedCents: number }[]) => sum(members.map((m) => Math.max(0, m.creditCents - m.creditUsedCents)));
 
 // ---- A member's balance ---------------------------------------------------------------------------------------------------------
 

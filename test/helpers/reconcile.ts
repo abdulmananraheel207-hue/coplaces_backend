@@ -192,7 +192,7 @@ export async function reconcile(ctx: Ctx, s: Scenario): Promise<Check[]> {
   );
   // The company's 10,000.00 advance must come off its invoices.
   const companyLive = live.filter((i) => i.memberId === s.companyMemberId);
-  check('company: advance taken off its invoices', sum(companyLive.map(advanceLines)), 1_000_000, 'H1');
+  check('company: advance taken off its invoices', sum(companyLive.map(advanceLines)), 1_000_000);
 
   // ---- a report that ends last month: aging and deposits as of that day
   const prevEnd = addDays(`${to.slice(0, 7)}-01`, -1);

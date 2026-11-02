@@ -110,8 +110,8 @@ describe('financeCore returns exactly what the endpoints return today', () => {
   });
 
   it('advances not yet applied (no endpoint shows this today)', async () => {
-    // The plan member's 2,000 advance was used in full; the company's 10,000 advance was never applied (H1).
-    expect(core.advancesUnappliedCents({ members: r.members, contracts: r.contracts })).toBe(1_000_000);
+    // The plan member's 2,000 advance and the company's 10,000 advance were both used in full on their invoices.
+    expect(core.advancesUnappliedCents({ members: r.members, contracts: r.contracts })).toBe(0);
   });
 });
 
@@ -145,7 +145,7 @@ describe('where today’s definitions differ from the correct ones', () => {
 
   it('D4 invoiced (R1): leaves out the part of a bill an advance paid, while collected counts the advance in full', async () => {
     const days = { from: s.from, to: s.to };
-    expect(core.billedCents(r.invoices, r.lines, days) - core.invoicedCents(r.invoices, days)).toBe(200_000);
+    expect(core.billedCents(r.invoices, r.lines, days) - core.invoicedCents(r.invoices, days)).toBe(1_200_000); // the plan member's 2,000 and the company's 10,000
     expect(rep.totals.invoicedCents).toBe(core.invoicedCents(r.invoices, days));
   });
 
@@ -176,8 +176,8 @@ describe('where today’s definitions differ from the correct ones', () => {
     expect(d.outstandingCents).toBe(11_000); // the Today page leaves the 400 out too
   });
 
-  it('D8 advances not yet applied: the company advance is income but sits unapplied, and nothing reports it', async () => {
-    expect(core.advancesUnappliedCents({ members: r.members, contracts: r.contracts })).toBe(1_000_000);
-    expect(JSON.stringify(rep)).not.toContain('unapplied');
+  it('D8 advances not yet applied (fixed by H1): a company advance is used on its invoice, so nothing is left unapplied', async () => {
+    expect(core.advancesUnappliedCents({ members: r.members, contracts: r.contracts })).toBe(0);
+    expect(r.contracts.find((c) => c.companyName)!.advanceUsedCents).toBe(1_000_000);
   });
 });

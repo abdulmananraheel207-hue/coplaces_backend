@@ -12,6 +12,7 @@ import { isValidDate } from '../lib/time.js';
 import { parse } from '../lib/validate.js';
 import { money } from '../lib/money.js';
 import { audit } from '../services/audit.js';
+import { applyContractAdvanceToOpenInvoice } from '../services/billing.js';
 import { addPerson, createCompanyContract, discardCompanyDraft, extendContract, refreshRent, removePerson, setContractSpaces } from '../services/companyContracts.js';
 import { monthCharges, monthlyTotal } from '../services/contractPricing.js';
 import { activateContract, endContract } from '../services/contracts.js';
@@ -286,7 +287,10 @@ export function contractsRouter(db: Db) {
         .values({ locationId: c.locationId, contractId: c.id, kind: 'advance', amountCents: c.advanceCents, method: body.method, reference: body.reference, occurredAt: now, recordedById: user.id })
         .run();
       await audit(tx, { organizationId: user.organizationId, locationId: c.locationId, actorId: user.id, action: 'advance.receive', entity: 'contract', entityId: c.id, amountCents: c.advanceCents, data: { method: body.method, reference: body.reference } });
-      return tx.update(contracts).set({ advanceReceivedAt: now }).where(eq(contracts.id, c.id)).returning().get();
+      await tx.update(contracts).set({ advanceReceivedAt: now }).where(eq(contracts.id, c.id)).run();
+      // Received after the contract's invoice was made: it comes off that invoice now.
+      await applyContractAdvanceToOpenInvoice(tx, c.id);
+      return tx.select().from(contracts).where(eq(contracts.id, c.id)).get();
     });
     res.json(out);
   });

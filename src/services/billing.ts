@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNull, lt, ne, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, lt, ne, sql } from 'drizzle-orm';
 import type { Db, DbLike } from '../db/client.js';
 import { LINE_CATEGORIES, amenityOrders, bookings, contractPeople, contracts, invoiceItems, invoices, locations, members, payments, plans, resources, users } from '../db/schema.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
@@ -238,8 +238,67 @@ export function voidInvoice(db: DbLike, invoiceId: string, actorId?: string) {
 }
 
 /**
- * Bills every active member for `month` ('YYYY-MM'): the monthly plan fee plus any unbilled paid bookings.
- * Idempotent: a member with a non-void subscription invoice for the month is skipped.
+ * Takes what is left of a member's advance, then of their credit, off an invoice's lines: advance first (rent paid up front), then
+ * credit (paid periods they did not use). Returns the lines to add and records how much of each was used. Never more than `grossCents`.
+ */
+export async function takeMemberCredits(tx: DbLike, memberId: string, grossCents: number): Promise<LineItem[]> {
+  const m = await tx.select().from(members).where(eq(members.id, memberId)).get();
+  if (!m || grossCents <= 0) return [];
+  const lines: LineItem[] = [];
+  const advance = Math.min(Math.max(0, m.advanceCents - m.advanceUsedCents), grossCents);
+  const credit = Math.min(Math.max(0, m.creditCents - m.creditUsedCents), grossCents - advance);
+  if (advance > 0) lines.push({ description: 'Advance paid', quantity: 1, unitPriceCents: -advance, category: 'advance' });
+  if (credit > 0) lines.push({ description: 'Credit from an earlier invoice', quantity: 1, unitPriceCents: -credit, category: 'credit' });
+  if (advance > 0 || credit > 0) await tx.update(members).set({ advanceUsedCents: m.advanceUsedCents + advance, creditUsedCents: m.creditUsedCents + credit }).where(eq(members.id, memberId)).run();
+  return lines;
+}
+
+/** Takes what is left of a contract's advance off its invoice's lines. */
+async function takeContractAdvance(tx: DbLike, contractId: string, grossCents: number): Promise<LineItem[]> {
+  const c = (await tx.select().from(contracts).where(eq(contracts.id, contractId)).get())!;
+  const left = c.advanceReceivedAt ? Math.max(0, c.advanceCents - c.advanceUsedCents) : 0;
+  const take = Math.min(left, grossCents);
+  if (take <= 0) return [];
+  await tx.update(contracts).set({ advanceUsedCents: c.advanceUsedCents + take }).where(eq(contracts.id, c.id)).run();
+  return [{ description: 'Advance paid', quantity: 1, unitPriceCents: -take, category: 'advance' }];
+}
+
+const gross = (items: LineItem[]) => items.reduce((sum, i) => sum + i.quantity * i.unitPriceCents, 0);
+
+/**
+ * Adds an advance or credit line to an invoice that already exists and has nothing paid on it, up to its subtotal, and works its totals
+ * out again at the rate it was issued at. Returns how much was taken off. For money that arrives after its invoice was made.
+ */
+export async function creditOpenInvoice(tx: DbLike, inv: Invoice, line: { description: string; category: 'advance' | 'credit' }, maxCents: number) {
+  if (inv.status !== 'open' || inv.paidCents !== 0 || inv.subtotalCents <= 0 || maxCents <= 0) return 0;
+  const take = Math.min(maxCents, inv.subtotalCents);
+  const rate = inv.taxRateBps ?? (await tx.select({ r: locations.taxRateBps }).from(locations).where(eq(locations.id, inv.locationId)).get())!.r;
+  await tx.insert(invoiceItems).values({ invoiceId: inv.id, description: line.description, quantity: 1, unitPriceCents: -take, amountCents: -take, category: line.category }).run();
+  const totals = calcTotals([{ description: '', quantity: 1, unitPriceCents: inv.subtotalCents - take }], rate);
+  await tx.update(invoices).set({ ...totals, status: totals.totalCents === 0 ? 'paid' : 'open' }).where(eq(invoices.id, inv.id)).run();
+  return take;
+}
+
+/** A contract's advance received after its invoice was made comes off the newest open, unpaid invoice of that contract. */
+export async function applyContractAdvanceToOpenInvoice(tx: DbLike, contractId: string) {
+  const c = (await tx.select().from(contracts).where(eq(contracts.id, contractId)).get())!;
+  const left = c.advanceReceivedAt ? c.advanceCents - c.advanceUsedCents : 0;
+  if (left <= 0) return;
+  const inv = await tx.select().from(invoices).where(and(eq(invoices.contractId, c.id), eq(invoices.status, 'open'), eq(invoices.paidCents, 0))).orderBy(desc(invoices.createdAt)).get();
+  if (!inv) return;
+  const took = await creditOpenInvoice(tx, inv, { description: 'Advance paid', category: 'advance' }, left);
+  if (took > 0) await tx.update(contracts).set({ advanceUsedCents: c.advanceUsedCents + took }).where(eq(contracts.id, c.id)).run();
+}
+
+/**
+ * Monthly billing for `month` ('YYYY-MM'). Two kinds of invoice, each made at most once for the month, so running it again bills nothing new.
+ *
+ * 1. Every contract (single member or company) that runs during the month: its rent for the days it runs, and for a company the
+ *    unbilled bookings and amenities of the people on it that month, less what is left of the contract's advance. One per contract per
+ *    month, found by `invoices.contractId`, whoever the contact is now.
+ * 2. Every member who is not on a company contract that month: the price of a plan from before shifts (active members only; plans with
+ *    shifts bill each period when it starts), then their unbilled bookings and amenities, less what is left of their advance and credit.
+ *    Cancelled and paused members are billed for bookings and amenities they had, never for a plan.
  */
 export function generateSubscriptionInvoices(
   db: Db,
@@ -252,105 +311,95 @@ export function generateSubscriptionInvoices(
     const today = todayIn(loc.timezone, now);
     const issueDate = today;
     const dueDate = addDays(today, opts.dueInDays);
-    const monthLabel = new Date(`${range.firstDay}T12:00:00Z`).toLocaleString('en-US', {
-      month: 'long',
-      year: 'numeric',
-      timeZone: 'UTC',
-    });
-
-    const candidates = (await tx
-      .select({ member: members, plan: plans })
-      .from(members)
-      .leftJoin(plans, eq(plans.id, members.planId))
-      .where(and(eq(members.locationId, loc.id), eq(members.status, 'active')))
-      .all())
-      .filter(({ member }) => member.startDate < range.nextFirstDay && (!member.endDate || member.endDate >= range.firstDay));
-    // Employees on a company contract are billed on the company's invoice, not their own.
-    const onContract = new Set((await tx.select({ id: contractPeople.memberId }).from(contractPeople).all()).map((x) => x.id));
-    const own = candidates.filter(({ member }) => !onContract.has(member.id));
-
+    const monthLabel = new Date(`${range.firstDay}T12:00:00Z`).toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+    const lastDay = addDays(range.nextFirstDay, -1);
+    const base = { locationId: loc.id, kind: 'subscription' as const, issueDate, dueDate, periodStart: range.firstDay, actorId: opts.actorId };
     const created: Invoice[] = [];
     let skipped = 0;
-    for (const { member, plan } of own) {
-      const existing = await tx
-        .select({ id: invoices.id })
-        .from(invoices)
-        .where(
-          and(
-            eq(invoices.memberId, member.id),
-            eq(invoices.kind, 'subscription'),
-            eq(invoices.periodStart, range.firstDay),
-            ne(invoices.status, 'void'),
-          ),
-        )
-        .get();
-      if (existing) {
-        skipped++;
-        continue;
-      }
 
-      const items: LineItem[] = [];
-      // A member on a plan with shifts is billed for each period by the shifts' prices when the period starts. The plan's own price
-      // is only for plans from before shifts, so it is not billed on top of that.
-      if (plan && plan.interval === 'month' && plan.priceCents > 0 && !member.planStart) {
-        items.push({ description: `${plan.name} membership — ${monthLabel}`, quantity: 1, unitPriceCents: plan.priceCents });
-      }
-
-      items.push(...(await bookingItems(tx, [member.id], range, loc.timezone, now)));
-      items.push(...(await amenityItems(tx, [member.id])));
-
-      if (items.length === 0) {
-        skipped++;
-        continue;
-      }
-      created.push(
-        await createInvoice(tx, {
-          locationId: loc.id,
-          memberId: member.id,
-          kind: 'subscription',
-          issueDate,
-          dueDate,
-          periodStart: range.firstDay,
-          items,
-        }),
-      );
-    }
-    // One invoice per company: each person's share of the rent, then every employee's unbilled bookings.
-    const companies = (await tx.select().from(contracts).where(and(eq(contracts.locationId, loc.id), ne(contracts.companyName, ''), inArray(contracts.status, ['active', 'ended']))).all()).filter(
+    // ---- 1. Contracts
+    const running = (await tx.select().from(contracts).where(and(eq(contracts.locationId, loc.id), inArray(contracts.status, ['active', 'ended']))).all()).filter(
       (c) => c.startDate < range.nextFirstDay && (!c.endDate || c.endDate >= range.firstDay),
     );
-    for (const c of companies) {
-      const done = await tx
-        .select({ id: invoices.id })
-        .from(invoices)
-        .where(and(eq(invoices.memberId, c.memberId), eq(invoices.kind, 'subscription'), eq(invoices.periodStart, range.firstDay), ne(invoices.status, 'void')))
-        .get();
-      if (done) {
-        skipped++;
-        continue;
-      }
-      const people = (await tx
+    const covers = (p: { joinDate: string; leaveDate: string | null }) => p.joinDate <= lastDay && (!p.leaveDate || p.leaveDate >= range.firstDay);
+    const employees = new Set<string>();
+    const peopleOf = new Map<string, { p: typeof contractPeople.$inferSelect; name: string }[]>();
+    for (const c of running.filter((x) => x.companyName)) {
+      const people = await tx
         .select({ p: contractPeople, name: users.name })
         .from(contractPeople)
         .innerJoin(members, eq(members.id, contractPeople.memberId))
         .innerJoin(users, eq(users.id, members.userId))
         .where(eq(contractPeople.contractId, c.id))
-        .all());
-      const rent = monthCharges(
-        { pricingMode: c.pricingMode, pricePerMemberCents: c.pricePerMemberCents, extraMemberCents: c.extraMemberCents, fixedPriceCents: c.fixedPriceCents, startDate: c.startDate, endDate: c.endDate },
-        people.map(({ p, name }) => ({ name, joinDate: p.joinDate, leaveDate: p.leaveDate, hasDesk: !!p.deskResourceId })),
-        await seatsOf(tx as unknown as Db, c.id),
-        range.firstDay,
-        range.nextFirstDay,
-      );
-      const items: LineItem[] = rent.map((l) => ({ description: `${c.companyName}: ${l.description} — ${monthLabel}`, quantity: 1, unitPriceCents: l.amountCents }));
-      items.push(...(await bookingItems(tx, people.map(({ p }) => p.memberId), range, loc.timezone, now)));
-      items.push(...(await amenityItems(tx, people.map(({ p }) => p.memberId))));
+        .all();
+      peopleOf.set(c.id, people);
+      for (const x of people) if (covers(x.p)) employees.add(x.p.memberId);
+    }
+
+    for (const c of running) {
+      const done = await tx.select({ id: invoices.id }).from(invoices).where(and(eq(invoices.contractId, c.id), eq(invoices.periodStart, range.firstDay), ne(invoices.status, 'void'))).get();
+      if (done) {
+        skipped++;
+        continue;
+      }
+      const items: LineItem[] = [];
+      if (c.companyName) {
+        const people = peopleOf.get(c.id) ?? [];
+        const rent = monthCharges(
+          { pricingMode: c.pricingMode, pricePerMemberCents: c.pricePerMemberCents, extraMemberCents: c.extraMemberCents, fixedPriceCents: c.fixedPriceCents, startDate: c.startDate, endDate: c.endDate },
+          people.map(({ p, name }) => ({ name, joinDate: p.joinDate, leaveDate: p.leaveDate, hasDesk: !!p.deskResourceId })),
+          await seatsOf(tx as unknown as Db, c.id),
+          range.firstDay,
+          range.nextFirstDay,
+        );
+        items.push(...rent.map((l) => ({ description: `${c.companyName}: ${l.description} — ${monthLabel}`, quantity: 1, unitPriceCents: l.amountCents, category: 'rent' as const })));
+        const here = people.filter((x) => covers(x.p)).map((x) => x.p.memberId);
+        if (here.length) {
+          items.push(...(await bookingItems(tx, here, range, loc.timezone, now)));
+          items.push(...(await amenityItems(tx, here)));
+        }
+      } else if (c.rentCents > 0) {
+        // A single member's rent, by the day for a month the contract starts or ends in, like a company's.
+        const space = c.resourceId ? (await tx.select({ n: resources.name }).from(resources).where(eq(resources.id, c.resourceId)).get())?.n : undefined;
+        const rent = monthCharges({ pricingMode: 'fixed', pricePerMemberCents: 0, extraMemberCents: 0, fixedPriceCents: c.rentCents, startDate: c.startDate, endDate: c.endDate }, [], 0, range.firstDay, range.nextFirstDay);
+        items.push(...rent.map((l) => ({ description: `Rent${space ? `: ${space}` : ''}${l.description.replace('Space rent', '')} — ${monthLabel}`, quantity: 1, unitPriceCents: l.amountCents, category: 'rent' as const, resourceId: c.resourceId })));
+      }
       if (!items.length) {
         skipped++;
         continue;
       }
-      created.push(await createInvoice(tx, { locationId: loc.id, memberId: c.memberId, kind: 'subscription', issueDate, dueDate, periodStart: range.firstDay, items }));
+      items.push(...(await takeContractAdvance(tx, c.id, gross(items))));
+      created.push(await createInvoice(tx, { ...base, memberId: c.memberId, contractId: c.id, items }));
+    }
+
+    // ---- 2. Members
+    const candidates = (await tx.select({ member: members, plan: plans }).from(members).leftJoin(plans, eq(plans.id, members.planId)).where(eq(members.locationId, loc.id)).all()).filter(
+      ({ member }) => member.startDate < range.nextFirstDay && !employees.has(member.id),
+    );
+    for (const { member, plan } of candidates) {
+      const existing = await tx
+        .select({ id: invoices.id })
+        .from(invoices)
+        .where(and(eq(invoices.memberId, member.id), eq(invoices.kind, 'subscription'), eq(invoices.periodStart, range.firstDay), isNull(invoices.contractId), ne(invoices.status, 'void')))
+        .get();
+      if (existing) {
+        skipped++;
+        continue;
+      }
+      const items: LineItem[] = [];
+      // A plan with shifts bills each period when it starts; the plan's own price is only for plans from before shifts.
+      const plansThisMonth = member.status === 'active' && (!member.endDate || member.endDate >= range.firstDay);
+      if (plansThisMonth && plan && plan.interval === 'month' && plan.priceCents > 0 && !member.planStart) {
+        items.push({ description: `${plan.name} membership — ${monthLabel}`, quantity: 1, unitPriceCents: plan.priceCents, category: 'plan', planId: plan.id });
+      }
+      items.push(...(await bookingItems(tx, [member.id], range, loc.timezone, now)));
+      items.push(...(await amenityItems(tx, [member.id])));
+      if (items.length === 0) {
+        skipped++;
+        continue;
+      }
+      items.push(...(await takeMemberCredits(tx, member.id, gross(items))));
+      created.push(await createInvoice(tx, { ...base, memberId: member.id, items }));
     }
     return { created, skipped };
   });
@@ -370,6 +419,8 @@ async function bookingItems(tx: DbLike, memberIds: string[], range: { end: strin
     quantity: 1,
     unitPriceCents: booking.priceCents,
     bookingId: booking.id,
+    category: 'booking' as const,
+    resourceId: booking.resourceId,
   }));
 }
 
@@ -383,7 +434,7 @@ export async function amenityItems(tx: DbLike, memberIds: string[]): Promise<Lin
     .all();
   return owed.map((o) => {
     const paid = o.quantity - o.freeQuantity;
-    return { description: `${o.name}, ${o.date}`, quantity: paid, unitPriceCents: Math.round(o.chargeCents / paid), amenityOrderId: o.id };
+    return { description: `${o.name}, ${o.date}`, quantity: paid, unitPriceCents: Math.round(o.chargeCents / paid), amenityOrderId: o.id, category: 'amenity' as const };
   });
 }
 
