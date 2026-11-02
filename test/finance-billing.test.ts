@@ -142,3 +142,44 @@ describe('a person who left a company contract', () => {
     expect(sum(own[0]!.items.map((l) => l.amountCents))).toBe(5_000);
   });
 });
+
+describe('changing plan part way through a period', () => {
+  const periodOf = (start: string) => {
+    const end = addDays(addMonths(start.slice(0, 7), 1) + start.slice(7), -1);
+    return { end, total: daysBetween(start, end) + 1, left: daysBetween(today(), end) + 1 };
+  };
+
+  it('with an unpaid invoice: voids it, bills the days already used at the old shifts and the rest at the new ones', async () => {
+    const ctx = await setup();
+    const owner = await ownerOf(ctx);
+    const p = await planWithShifts(ctx, owner);
+    const start = addDays(today(), -10);
+    const mem = await planMember(ctx, owner, p, { startDate: start });
+    const { total, left } = periodOf(start);
+    await owner.put(`/api/members/${mem.id}/plan`).send({ planId: p.plan.id, shiftIds: [p.morning.id, p.evening.id], deskIds: [p.desks[0]!.id] }).expect(200);
+    const bills = await invoicesOf(ctx, mem.id);
+    expect(bills.map((b) => b.status)).toEqual(['void', 'open']);
+    const used = total - left;
+    expect(bills[1]!.subtotalCents).toBe(Math.round((500_000 * used) / total) + Math.round((500_000 * left) / total) + Math.round((400_000 * left) / total));
+    expect(bills[1]!.items.some((l) => l.description.includes(`used ${used} of ${total} days`))).toBe(true);
+  });
+
+  it('with a paid invoice: keeps it, credits the unused paid days and bills only the new shift for the days left', async () => {
+    const ctx = await setup();
+    const owner = await ownerOf(ctx);
+    const p = await planWithShifts(ctx, owner);
+    const start = addDays(today(), -10);
+    const mem = await planMember(ctx, owner, p, { startDate: start });
+    const first = (await invoicesOf(ctx, mem.id))[0]!;
+    await owner.post(`/api/invoices/${first.id}/payments`).send({ amountCents: first.totalCents, method: 'cash' }).expect(201);
+    const { total, left } = periodOf(start);
+    await owner.put(`/api/members/${mem.id}/plan`).send({ planId: p.plan.id, shiftIds: [p.morning.id, p.evening.id], deskIds: [p.desks[0]!.id] }).expect(200);
+    const bills = await invoicesOf(ctx, mem.id);
+    expect(bills.map((b) => b.status)).toEqual(['paid', 'open']);
+    const credit = Math.round((500_000 * left) / total);
+    const charged = Math.round((500_000 * left) / total) + Math.round((400_000 * left) / total);
+    expect(bills[1]!.subtotalCents).toBe(charged - credit);
+    expect(bills[1]!.items.find((l) => l.category === 'credit')!.amountCents).toBe(-credit);
+    expect((await rows.member(ctx, mem.id))!).toMatchObject({ creditCents: credit, creditUsedCents: credit });
+  });
+});

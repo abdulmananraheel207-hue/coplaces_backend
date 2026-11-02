@@ -175,10 +175,13 @@ describe('changing a member\'s plan, shifts and desks', () => {
     const ctx = await setup();
     const p = await planWithShifts(ctx);
     const mem = (await newMember(ctx, p).expect(201)).body;
-    await ctx.db.update(invoices).set({ paidCents: 500_000, status: 'paid' }).where(eq(invoices.memberId, mem.id)).run();
+    const first = (await ctx.db.select().from(invoices).where(eq(invoices.memberId, mem.id)).get())!;
+    await p.owner.post(`/api/invoices/${first.id}/payments`).send({ amountCents: first.totalCents, method: 'cash' }).expect(201);
     await put(p, mem.id, { planId: p.plan.id, shiftIds: [p.morning.id, p.evening.id], deskIds: [p.desks[0]!.id] }).expect(200);
     const bills = await ctx.db.select().from(invoices).where(eq(invoices.memberId, mem.id)).all();
-    expect(bills.map((b) => b.subtotalCents).sort()).toEqual([400_000, 500_000]); // the paid one kept, plus only the evening shift
+    // The paid one is kept. The period has not started, so the morning shift already paid for becomes credit on the new invoice,
+    // which then asks only for the evening shift.
+    expect(bills.map((b) => b.subtotalCents).sort()).toEqual([400_000, 500_000]);
     expect(bills.some((b) => b.status === 'void')).toBe(false);
   });
 

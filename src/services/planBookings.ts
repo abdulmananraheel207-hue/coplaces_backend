@@ -1,12 +1,13 @@
-import { and, desc, eq, gt, gte, inArray, isNull, lt, lte, ne, or } from 'drizzle-orm';
+import { and, desc, eq, gt, gte, inArray, isNull, lt, lte, ne, or, sql } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
-import { bookings, invoices, locationHolidays, memberDesks, memberShifts, members, plans, resourceAssignments, resources, shiftSpaces, shiftTemplates } from '../db/schema.js';
+import { bookings, invoiceItems, invoices, locationHolidays, memberDesks, memberShifts, members, plans, resourceAssignments, resources, shiftSpaces, shiftTemplates } from '../db/schema.js';
 import { loadLocation } from '../lib/access.js';
-import { assertLocation, assertSees, type AuthUser } from '../lib/auth.js';
+import { assertLocation, assertSees, hasFeature, type AuthUser } from '../lib/auth.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { addDays, addMonthsToDate, businessDateOf, daysBetween, localDate, localTime, shiftWindow, spanMinutes, toMinutes, todayIn, zonedToUtc } from '../lib/time.js';
 import { createInvoice, takeMemberCredits, voidInvoice, type LineItem } from './billing.js';
 import { closedReason, weekdayOf } from './bookings.js';
+import { audit } from './audit.js';
 
 /**
  * Spaces a plan hands to a member: desks and offices. Meeting-type rooms (meeting, board, training rooms) are not on plans:
@@ -153,12 +154,22 @@ async function bookPeriod(t: Db, actor: AuthUser, memberId: string, plan: Plan, 
 const itemsFor = (plan: Plan, shifts: Shift[], start: string, end: string): LineItem[] =>
   shifts.filter((s) => (s.priceCents ?? 0) > 0).map((s) => ({ description: `${plan.name}: ${s.name} ${s.startTime}–${s.endTime}, ${start} to ${end}`, quantity: 1, unitPriceCents: s.priceCents!, category: 'plan' as const, planId: plan.id }));
 
-async function invoiceItems(t: Db, locationId: string, memberId: string, items: LineItem[], start: string, tz: string) {
-  if (!items.length) return null;
+/** Days from `a` to `b`, both included; 0 when `b` is before `a`. */
+const daysIncl = (a: string, b: string) => Math.max(0, daysBetween(a, b) + 1);
+
+/** The same lines for part of a period: each price times `days / total`, rounded per line, with the days said on the line. */
+const share = (items: LineItem[], days: number, total: number, word: string): LineItem[] =>
+  days >= total
+    ? items
+    : items.map((i) => ({ ...i, unitPriceCents: Math.round((i.unitPriceCents * days) / total), description: `${i.description} (${word} ${days} of ${total} days)` })).filter((i) => i.unitPriceCents !== 0);
+
+/** Bills plan lines on a new invoice, less the member's advance and credit. Nothing without invoicing in the package. */
+async function billPlanLines(t: Db, actor: AuthUser, locationId: string, memberId: string, items: LineItem[], start: string, tz: string) {
+  if (!items.length || !hasFeature(actor, 'invoicing')) return null;
   const today = todayIn(tz);
   // What the member paid in advance (and any credit from a paid period they did not use) comes off the shift prices, until used up.
   items = [...items, ...(await takeMemberCredits(t, memberId, items.reduce((s, i) => s + i.quantity * i.unitPriceCents, 0)))];
-  return createInvoice(t, { locationId, memberId, kind: 'subscription', issueDate: today, dueDate: addDays(today, 7), periodStart: start, items });
+  return createInvoice(t, { locationId, memberId, kind: 'subscription', issueDate: today, dueDate: addDays(today, 7), periodStart: start, items, actorId: actor.id });
 }
 
 /**
@@ -169,17 +180,23 @@ export async function startPlanPeriod(t: Db, actor: AuthUser, memberId: string, 
   const end = periodEnd(plan.interval, start);
   const { loc, shifts } = await bookPeriod(t, actor, memberId, plan, shiftIds, spaceIds, { start, end, from: start });
   const items = itemsFor(plan, shifts, start, end);
-  const invoice = await invoiceItems(t, loc.id, memberId, items, start, loc.timezone);
+  const invoice = await billPlanLines(t, actor, loc.id, memberId, items, start, loc.timezone);
   return { start, end, totalCents: items.reduce((s, i) => s + i.unitPriceCents, 0), invoiceId: invoice?.id ?? null };
 }
 
 /**
  * Changes a member's plan, shifts or desks, for example when one was forgotten. What has not happened yet is re-booked from today:
  * the old plan bookings that have not started are cancelled and new ones made. Days already gone are left as they were.
- * The bill follows: an unpaid invoice for the period is replaced, and if it was already paid only the extra is billed.
+ *
+ * The bill follows the days, all in the same transaction as the bookings, so a failure part way leaves everything as it was:
+ * - the new shifts are billed for the days of the period still to come (all of it when the period has not started);
+ * - an old invoice for the period that is unpaid is voided (its advance and credit go back), and the days of it already used are
+ *   billed again on the new invoice;
+ * - an old invoice that was paid, in full or in part, stays; the share of what was paid for days not used becomes the member's credit,
+ *   which comes off the new invoice and, if more is left, their next ones.
  */
-export async function changePlan(db: Db, actor: AuthUser, memberId: string, input: { planId: string | null; shiftIds: string[]; spaceIds: string[]; startDate?: string | undefined }) {
-  const out = await db.transaction(async (tx) => {
+export function changePlan(db: Db, actor: AuthUser, memberId: string, input: { planId: string | null; shiftIds: string[]; spaceIds: string[]; startDate?: string | undefined }) {
+  return db.transaction(async (tx) => {
     const t = tx as unknown as Db;
     const member = await t.select().from(members).where(eq(members.id, memberId)).get();
     if (!member) throw notFound('Member');
@@ -190,9 +207,8 @@ export async function changePlan(db: Db, actor: AuthUser, memberId: string, inpu
     const plan = input.planId ? await t.select().from(plans).where(eq(plans.id, input.planId)).get() : null;
     if (input.planId && (!plan || plan.locationId !== member.locationId)) throw badRequest('Plan does not belong to this location');
 
-    // What they took before, to work out the bill afterwards.
-    const before = await t.select({ s: shiftTemplates }).from(memberShifts).innerJoin(shiftTemplates, eq(shiftTemplates.id, memberShifts.shiftId)).where(eq(memberShifts.memberId, member.id)).all();
     const oldStart = member.planStart;
+    const oldEnd = member.planEnd;
     const dayStart = zonedToUtc(today, '00:00', loc.timezone).toISOString();
     const stopFuture = () =>
       t.update(bookings)
@@ -200,49 +216,71 @@ export async function changePlan(db: Db, actor: AuthUser, memberId: string, inpu
         .where(and(eq(bookings.memberId, member.id), eq(bookings.source, 'plan'), eq(bookings.status, 'confirmed'), isNull(bookings.checkedInAt), gte(bookings.startsAt, dayStart)))
         .run();
 
-    // No plan, or a plan that has no shifts: nothing to book.
+    // ---- the bookings
+    let next: { shifts: Shift[]; start: string; end: string; from: string } | null = null;
     const offered = plan ? await t.select({ id: shiftTemplates.id }).from(shiftTemplates).where(and(eq(shiftTemplates.planId, plan.id), eq(shiftTemplates.active, true))).all() : [];
     if (!plan || !offered.length) {
+      // No plan, or a plan that has no shifts: nothing to book.
       if (plan && input.shiftIds.length) throw badRequest('Those shifts are not part of this plan');
       await stopFuture();
       await t.delete(memberShifts).where(eq(memberShifts.memberId, member.id)).run();
       await t.delete(memberDesks).where(eq(memberDesks.memberId, member.id)).run();
       await t.update(members).set({ planId: plan?.id ?? null, planStart: null, planEnd: null }).where(eq(members.id, member.id)).run();
-      return { shifts: [] as Shift[], plan, start: today, end: today, samePlan: false, before, oldStart, loc };
-    }
-
-    const samePlan = member.planId === plan.id && !!member.planStart && !!member.planEnd && !input.startDate;
-    const start = samePlan ? member.planStart! : (input.startDate ?? today);
-    const end = samePlan ? member.planEnd! : periodEnd(plan.interval, start);
-    const from = start > today ? start : today;
-    if (end < from) throw badRequest('This plan period has already ended. Renew it instead');
-    await stopFuture();
-    const { shifts } = await bookPeriod(t, actor, member.id, plan, input.shiftIds, input.spaceIds, { start, end, from });
-    return { shifts, plan, start, end, samePlan, before, oldStart, loc };
-  });
-
-  // The bill, after the bookings are safe.
-  const { shifts, plan, start, end, samePlan, before, oldStart, loc } = out;
-  let invoiceId: string | null = null;
-  const oldInvoice = oldStart
-    ? await db.select().from(invoices).where(and(eq(invoices.memberId, memberId), eq(invoices.kind, 'subscription'), eq(invoices.periodStart, oldStart), ne(invoices.status, 'void'))).orderBy(desc(invoices.createdAt)).get()
-    : undefined;
-  if (plan && shifts.length) {
-    const all = itemsFor(plan, shifts, start, end);
-    if (oldInvoice && oldInvoice.status === 'open' && oldInvoice.paidCents === 0) {
-      await voidInvoice(db, oldInvoice.id); // gives back the advance it used
-      invoiceId = (await invoiceItems(db, loc.id, memberId, all, start, loc.timezone))?.id ?? null;
-    } else if (samePlan && oldInvoice) {
-      // Already paid, or part paid: keep it, and bill only what they now have that they did not.
-      const had = new Set(before.map((b) => b.s.id));
-      invoiceId = (await invoiceItems(db, loc.id, memberId, itemsFor(plan, shifts.filter((s) => !had.has(s.id)), start, end), start, loc.timezone))?.id ?? null;
     } else {
-      invoiceId = (await invoiceItems(db, loc.id, memberId, all, start, loc.timezone))?.id ?? null;
+      const samePlan = member.planId === plan.id && !!oldStart && !!oldEnd && !input.startDate;
+      const start = samePlan ? oldStart! : (input.startDate ?? today);
+      const end = samePlan ? oldEnd! : periodEnd(plan.interval, start);
+      const from = start > today ? start : today;
+      if (end < from) throw badRequest('This plan period has already ended. Renew it instead');
+      await stopFuture();
+      const { shifts } = await bookPeriod(t, actor, member.id, plan, input.shiftIds, input.spaceIds, { start, end, from });
+      next = { shifts, start, end, from };
     }
-  } else if (oldInvoice && oldInvoice.status === 'open' && oldInvoice.paidCents === 0) {
-    await voidInvoice(db, oldInvoice.id);
-  }
-  return { start, end, invoiceId };
+
+    // ---- the bill
+    if (!hasFeature(actor, 'invoicing')) return { start: next?.start ?? today, end: next?.end ?? today, invoiceId: null };
+    const oldInvoice = oldStart
+      ? await t
+          .select()
+          .from(invoices)
+          .where(and(eq(invoices.memberId, memberId), eq(invoices.kind, 'subscription'), isNull(invoices.contractId), eq(invoices.periodStart, oldStart), ne(invoices.status, 'void')))
+          .orderBy(desc(invoices.createdAt))
+          .get()
+      : undefined;
+    const lines: LineItem[] = [];
+
+    if (oldInvoice && oldStart && oldEnd) {
+      // How much of the old period was used: up to the day before the change takes effect.
+      const changeFrom = next ? next.from : today;
+      const total = daysIncl(oldStart, oldEnd);
+      const used = Math.min(total, daysIncl(oldStart, addDays(changeFrom, -1)));
+      const oldLines = await t.select().from(invoiceItems).where(eq(invoiceItems.invoiceId, oldInvoice.id)).all();
+      const charges = oldLines.filter((l) => l.amountCents > 0);
+      if (oldInvoice.status === 'open' && oldInvoice.paidCents === 0) {
+        await voidInvoice(t, oldInvoice.id, actor.id); // its advance and credit go back
+        if (used > 0) {
+          const asItems = charges.map((l) => ({ description: l.description, quantity: l.quantity, unitPriceCents: l.unitPriceCents, category: l.category, planId: l.planId, resourceId: l.resourceId }));
+          lines.push(...share(asItems, used, total, 'used'));
+        }
+      } else if (used < total) {
+        // What was paid for the period before tax: the cash share of the subtotal, plus advance or credit already taken off it.
+        const prepaid = -oldLines.filter((l) => l.amountCents < 0).reduce((s, l) => s + l.amountCents, 0);
+        const cash = oldInvoice.totalCents > 0 ? Math.round((Math.min(oldInvoice.paidCents, oldInvoice.totalCents) * oldInvoice.subtotalCents) / oldInvoice.totalCents) : 0;
+        const credit = Math.round(((cash + prepaid) * (total - used)) / total);
+        if (credit > 0) {
+          await t.update(members).set({ creditCents: sql`${members.creditCents} + ${credit}` }).where(eq(members.id, memberId)).run();
+          await audit(t, { organizationId: actor.organizationId, locationId: loc.id, actorId: actor.id, action: 'credit.add', entity: 'member', entityId: memberId, amountCents: credit, data: { invoiceId: oldInvoice.id, number: oldInvoice.number, unusedDays: total - used, totalDays: total } });
+        }
+      }
+    }
+
+    if (plan && next && next.shifts.length) {
+      const total = daysIncl(next.start, next.end);
+      lines.push(...share(itemsFor(plan, next.shifts, next.start, next.end), daysIncl(next.from, next.end), total, 'for'));
+    }
+    const invoice = await billPlanLines(t, actor, loc.id, memberId, lines, next?.start ?? oldStart ?? today, loc.timezone);
+    return { start: next?.start ?? today, end: next?.end ?? today, invoiceId: invoice?.id ?? null };
+  });
 }
 
 /** The next period for a member, with the same shifts and desks, starting after the current one ends (or today if it has lapsed). */

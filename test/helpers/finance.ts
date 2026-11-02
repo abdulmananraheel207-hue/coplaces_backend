@@ -94,7 +94,7 @@ export async function invoicesOf(ctx: Ctx, memberId: string) {
 
 /** What a member's standing (non-void) invoices took off for their advance. */
 export async function advanceTaken(ctx: Ctx, memberId: string) {
-  return -sum((await invoicesOf(ctx, memberId)).filter((i) => i.status !== 'void').flatMap((i) => i.items.filter((l) => l.amountCents < 0).map((l) => l.amountCents)));
+  return -sum((await invoicesOf(ctx, memberId)).filter((i) => i.status !== 'void' && !i.contractId).flatMap((i) => i.items.filter((l) => l.category === 'advance').map((l) => l.amountCents)));
 }
 
 /** A manual invoice for a member, created through the API. */

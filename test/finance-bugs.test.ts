@@ -122,7 +122,7 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect([a.status, b.status]).toEqual([400, 400]);
   });
 
-  knownBug('H6a: moving to another plan after paying credits the unused, already-paid period', async () => {
+  it('H6a: moving to another plan after paying credits the unused, already-paid period', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     const p = await planWithShifts(ctx, owner);
@@ -139,7 +139,7 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect(detail.balanceDueCents).toBe(0);
   });
 
-  knownBug('H6b: a plan change whose new invoice fails changes nothing, and never loses or reuses the advance', async () => {
+  it('H6b: a plan change whose new invoice fails changes nothing, and never loses or reuses the advance', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     const p = await planWithShifts(ctx, owner);
@@ -229,7 +229,7 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect(await ctx.db.select().from(invoices).where(eq(invoices.locationId, ctx.locB.id)).all()).toHaveLength(0);
   });
 
-  knownBug('M5b: a plan period does not create an invoice when the package has no invoicing', async () => {
+  it('M5b: a plan period does not create an invoice when the package has no invoicing', async () => {
     const ctx = await setup();
     const hive = await login(ctx.app, 'owner@hive.dev');
     const desk = (await hive.post('/api/resources').send({ locationId: ctx.locB.id, kind: 'hot_desk', name: 'H1' }).expect(201)).body;

@@ -78,15 +78,13 @@ async function checkBooks(ctx: Ctx, owner: Agent, step: string) {
     const owes = sum(live.filter((i) => i.memberId === m.id && i.status === 'open').map((i) => i.totalCents - i.paidCents));
     const detail = (await owner.get(`/api/members/${m.id}`).expect(200)).body;
     expect(detail.balanceDueCents, `${step}: balance of ${m.id}`).toBe(owes);
-    // an advance is used exactly as much as invoices that stand have taken off
-    const taken = sum(
-      (await Promise.all(live.filter((i) => i.memberId === m.id).map((i) => ctx.db.select().from(invoiceItems).where(eq(invoiceItems.invoiceId, i.id)).all())))
-        .flat()
-        .filter((l) => l.amountCents < 0)
-        .map((l) => -l.amountCents),
-    );
-    expect(m.advanceUsedCents, `${step}: advance used by ${m.id}`).toBe(taken);
+    // an advance, and a credit, are used exactly as much as the member's own invoices that stand have taken off
+    const lines = (await Promise.all(live.filter((i) => i.memberId === m.id && !i.contractId).map((i) => ctx.db.select().from(invoiceItems).where(eq(invoiceItems.invoiceId, i.id)).all()))).flat();
+    const taken = (category: string) => sum(lines.filter((l) => l.amountCents < 0 && l.category === category).map((l) => -l.amountCents));
+    expect(m.advanceUsedCents, `${step}: advance used by ${m.id}`).toBe(taken('advance'));
+    expect(m.creditUsedCents, `${step}: credit used by ${m.id}`).toBe(taken('credit'));
     expect(m.advanceUsedCents <= m.advanceCents, `${step}: advance not overused`).toBe(true);
+    expect(m.creditUsedCents <= m.creditCents, `${step}: credit not overused`).toBe(true);
   }
 }
 
