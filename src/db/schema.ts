@@ -68,6 +68,27 @@ export const PRICING_MODES = ['per_member', 'fixed'] as const;
 export const AMENITY_REQUEST_STATUSES = ['pending', 'served', 'declined', 'cancelled'] as const;
 export const DEPOSIT_STATUSES = ['pending', 'held', 'refunded', 'forfeited'] as const;
 export const DEPOSIT_ENTRY_KINDS = ['received', 'refunded', 'kept', 'advance'] as const;
+/**
+ * What an invoice line is for. Charges are what was sold; `advance` takes off money paid up front (already counted as income when it
+ * was received); `credit` takes off money already paid on an earlier invoice (an unused, paid plan period).
+ */
+export const LINE_CATEGORIES = ['plan', 'booking', 'amenity', 'rent', 'manual', 'advance', 'credit'] as const;
+export const AUDIT_ACTIONS = [
+  'invoice.create',
+  'invoice.void',
+  'payment.record',
+  'payment.reverse',
+  'expense.create',
+  'expense.update',
+  'expense.delete',
+  'deposit.receive',
+  'deposit.refund',
+  'deposit.keep',
+  'advance.receive',
+  'credit.add',
+  'amenities.collect',
+  'platform_payment.record',
+] as const;
 export const EXPENSE_CATEGORIES = [
   'rent',
   'utilities',
@@ -243,6 +264,9 @@ export const members = sqliteTable(
     depositReturnedCents: integer('deposit_returned_cents').notNull().default(0),
     /** Free meeting room time given to the member each month, in credit hours. Two credit hours are one hour. */
     meetingCredits: integer('meeting_credits').notNull().default(0),
+    /** Money already paid on an invoice for a period the member did not use (a plan changed part way). Taken off their next invoices. */
+    creditCents: integer('credit_cents').notNull().default(0),
+    creditUsedCents: integer('credit_used_cents').notNull().default(0),
     notes: text('notes').notNull().default(''),
     createdAt: createdAt(),
   },
@@ -590,11 +614,16 @@ export const invoices = sqliteTable(
     taxCents: integer('tax_cents').notNull().default(0),
     totalCents: integer('total_cents').notNull(),
     paidCents: integer('paid_cents').notNull().default(0), // maintained from payments
+    /** The tax rate the invoice was issued at, kept so later changes to it (an advance applied) use the same rate. */
+    taxRateBps: integer('tax_rate_bps'),
+    /** The contract a monthly rent invoice is for (single or company). One per contract per month. */
+    contractId: text('contract_id'),
     notes: text('notes').notNull().default(''),
     createdAt: createdAt(),
   },
   (t) => [
     index('invoices_location_idx').on(t.locationId, t.status),
+    index('invoices_contract_idx').on(t.contractId, t.periodStart),
     index('invoices_member_idx').on(t.memberId),
     index('invoices_period_idx').on(t.memberId, t.periodStart),
     uniqueIndex('invoices_location_number_idx').on(t.locationId, t.number),
@@ -613,6 +642,11 @@ export const invoiceItems = sqliteTable(
     unitPriceCents: integer('unit_price_cents').notNull(),
     amountCents: integer('amount_cents').notNull(),
     bookingId: text('booking_id'),
+    category: text('category', { enum: LINE_CATEGORIES }).notNull().default('manual'),
+    /** The space a line is for (a booking's room, a contract's office), for revenue by space. */
+    resourceId: text('resource_id'),
+    /** The plan a line is for, for revenue by plan. */
+    planId: text('plan_id'),
   },
   (t) => [index('invoice_items_invoice_idx').on(t.invoiceId)],
 );
@@ -638,6 +672,13 @@ export const payments = sqliteTable(
     recordedById: text('recorded_by_id')
       .notNull()
       .references(() => users.id),
+    /**
+     * Payments are never deleted. Taking one back writes a reversal: a second row with the negative amount, dated when it was taken
+     * back, pointing at the original. The original stays as it was, marked with when and by whom it was reversed.
+     */
+    reversesPaymentId: text('reverses_payment_id'),
+    reversedAt: text('reversed_at'),
+    reversedById: text('reversed_by_id'),
     createdAt: createdAt(),
   },
   (t) => [index('payments_location_idx').on(t.locationId, t.paidAt), index('payments_invoice_idx').on(t.invoiceId)],
@@ -716,6 +757,8 @@ export const contracts = sqliteTable(
     advanceCents: integer('advance_cents').notNull().default(0),
     /** When the advance was received; null while it is still to come. */
     advanceReceivedAt: text('advance_received_at'),
+    /** How much of the advance has been taken off this contract's invoices so far. */
+    advanceUsedCents: integer('advance_used_cents').notNull().default(0),
     status: text('status', { enum: CONTRACT_STATUSES }).notNull().default('draft'),
     notes: text('notes').notNull().default(''),
     /** A contract with a company name is a company contract: its employees are in `contractPeople`, and `memberId` is the one billed. */
@@ -1083,6 +1126,27 @@ export const issues = sqliteTable(
     resolvedAt: text('resolved_at'),
   },
   (t) => [index('issues_location_idx').on(t.locationId, t.status), index('issues_resource_idx').on(t.resourceId), index('issues_reporter_idx').on(t.reportedById)],
+);
+
+/** Every change to money, with who made it and what it was, so nothing about money changes without a trace. Never edited or deleted. */
+export const auditLog = sqliteTable(
+  'audit_log',
+  {
+    id: id(),
+    organizationId: text('organization_id').references(() => organizations.id),
+    locationId: text('location_id').references(() => locations.id),
+    actorId: text('actor_id')
+      .notNull()
+      .references(() => users.id),
+    action: text('action', { enum: AUDIT_ACTIONS }).notNull(),
+    entity: text('entity').notNull(),
+    entityId: text('entity_id').notNull(),
+    amountCents: integer('amount_cents'),
+    /** JSON: what the record was (and became), for reading back later. */
+    data: text('data').notNull().default('{}'),
+    createdAt: createdAt(),
+  },
+  (t) => [index('audit_log_location_idx').on(t.locationId, t.createdAt), index('audit_log_entity_idx').on(t.entity, t.entityId)],
 );
 
 /** A saved arrangement of things that can be dropped onto any floor of any location in the organization. */
