@@ -4,12 +4,13 @@ import { z } from 'zod';
 import type { Db } from '../db/client.js';
 import { CONTRACT_STATUSES, PAYMENT_METHODS, PRICING_MODES, bookings, contractPeople, contractSpaces, contracts, depositEntries, members, resourceAssignments, resources, users } from '../db/schema.js';
 import { loadMember, requireLocationId } from '../lib/access.js';
-import { assertLocation } from '../lib/auth.js';
+import { assertLocation, assertSees } from '../lib/auth.js';
 import { requirePermission } from '../lib/permissions.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { idParam, queryString } from '../lib/http.js';
 import { isValidDate } from '../lib/time.js';
 import { parse } from '../lib/validate.js';
+import { money } from '../lib/money.js';
 import { addPerson, createCompanyContract, discardCompanyDraft, extendContract, refreshRent, removePerson, setContractSpaces } from '../services/companyContracts.js';
 import { monthCharges, monthlyTotal } from '../services/contractPricing.js';
 import { activateContract, endContract } from '../services/contracts.js';
@@ -23,13 +24,12 @@ const contractFields = z.object({
   resourceId: z.string().nullable(),
   startDate: dateStr,
   endDate: dateStr.nullable(),
-  rentCents: z.number().int().min(0),
-  depositCents: z.number().int().min(0),
-  advanceCents: z.number().int().min(0),
+  rentCents: money,
+  depositCents: money,
+  advanceCents: money,
   notes: z.string().trim().max(1000),
 });
 
-const money = z.number().int().min(0).max(1_000_000_000_000);
 const pricing = {
   pricingMode: z.enum(PRICING_MODES),
   pricePerMemberCents: money,
@@ -62,7 +62,8 @@ const companyBody = z.object({
 /** Checks the member and space of a contract belong to the location and the space can be rented. */
 async function checkParties(db: Db, locationId: string, memberId: string, resourceId: string | null) {
   const { member } = await loadMember(db, memberId);
-  if (member.locationId !== locationId) throw badRequest('Member belongs to a different location');
+  // Another location's member is reported like one that does not exist.
+  if (member.locationId !== locationId) throw notFound('Member');
   if (resourceId) {
     const r = await db.select().from(resources).where(eq(resources.id, resourceId)).get();
     if (!r || r.locationId !== locationId) throw notFound('Space');
@@ -176,7 +177,7 @@ export function contractsRouter(db: Db) {
     );
     const c = await db.select().from(contracts).where(eq(contracts.id, idParam(req))).get();
     if (!c || !c.companyName) throw notFound('Contract');
-    assertLocation(req.user!, c.locationId);
+    assertSees(req.user!, c.locationId, 'Contract');
     if (c.status === 'ended' || c.status === 'cancelled') throw conflict(`This contract is ${c.status}`);
     if (c.status !== 'draft' && (body.startDate !== undefined || body.endDate !== undefined)) throw conflict('Dates can only be changed on a draft. Use Extend to move the end of a running contract.');
     if (c.advanceReceivedAt && body.advanceCents !== undefined && body.advanceCents !== c.advanceCents) throw conflict('The advance was already received, so its amount cannot change');
@@ -225,7 +226,7 @@ export function contractsRouter(db: Db) {
     const body = parse(contractFields.partial(), req.body);
     const c = await db.select().from(contracts).where(eq(contracts.id, idParam(req))).get();
     if (!c) throw notFound('Contract');
-    assertLocation(req.user!, c.locationId);
+    assertSees(req.user!, c.locationId, 'Contract');
     if (c.companyName) throw badRequest('Company contracts are changed from the company contract screen');
     if (c.status !== 'draft' && Object.keys(body).some((k) => k !== 'notes')) throw conflict('Only the notes can be changed once a contract has started');
     // Money already taken cannot be rewritten; the ledger would no longer match the contract.
@@ -249,7 +250,7 @@ export function contractsRouter(db: Db) {
   r.post('/:id/cancel', async (req, res) => {
     const c = await db.select().from(contracts).where(eq(contracts.id, idParam(req))).get();
     if (!c) throw notFound('Contract');
-    assertLocation(req.user!, c.locationId);
+    assertSees(req.user!, c.locationId, 'Contract');
     if (c.status !== 'draft') throw conflict('Only a draft can be cancelled. End a running contract instead.');
     if (c.companyName) {
       await discardCompanyDraft(db, req.user!, c.id);
@@ -264,7 +265,7 @@ export function contractsRouter(db: Db) {
   r.get('/:id/deposit-entries', async (req, res) => {
     const c = await db.select().from(contracts).where(eq(contracts.id, idParam(req))).get();
     if (!c) throw notFound('Contract');
-    assertLocation(req.user!, c.locationId);
+    assertSees(req.user!, c.locationId, 'Contract');
     res.json(await db.select().from(depositEntries).where(eq(depositEntries.contractId, c.id)).orderBy(asc(depositEntries.occurredAt)).all());
   });
 
@@ -275,7 +276,7 @@ export function contractsRouter(db: Db) {
     const out = await db.transaction(async (tx) => {
       const c = await tx.select().from(contracts).where(eq(contracts.id, idParam(req))).get();
       if (!c) throw notFound('Contract');
-      assertLocation(user, c.locationId);
+      assertSees(user, c.locationId, 'Contract');
       if (c.advanceCents <= 0) throw badRequest('This contract has no advance');
       if (c.advanceReceivedAt) throw conflict('The advance was already received');
       if (c.status === 'cancelled') throw conflict('This contract was cancelled');
@@ -294,7 +295,7 @@ export function contractsRouter(db: Db) {
     const body = parse(
       z.object({
         action: z.enum(['receive', 'refund', 'forfeit']),
-        returnedCents: z.number().int().min(0).optional(),
+        returnedCents: money.optional(),
         method: z.enum(PAYMENT_METHODS).default('cash'),
         reference: z.string().trim().max(100).default(''),
       }),
@@ -304,7 +305,7 @@ export function contractsRouter(db: Db) {
     const out = await db.transaction(async (tx) => {
       const c = await tx.select().from(contracts).where(eq(contracts.id, idParam(req))).get();
       if (!c) throw notFound('Contract');
-      assertLocation(user, c.locationId);
+      assertSees(user, c.locationId, 'Contract');
       const now = new Date().toISOString();
       const entry = (kind: 'received' | 'refunded' | 'kept', amountCents: number) =>
         tx

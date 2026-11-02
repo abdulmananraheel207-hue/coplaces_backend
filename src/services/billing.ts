@@ -2,6 +2,7 @@ import { and, asc, eq, inArray, isNull, lt, ne, sql } from 'drizzle-orm';
 import type { Db, DbLike } from '../db/client.js';
 import { amenityOrders, bookings, contractPeople, contracts, invoiceItems, invoices, locations, members, payments, plans, resources, users } from '../db/schema.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
+import { INVOICE_MAX, MONEY_MAX, QUANTITY_MAX } from '../lib/money.js';
 import { addDays, localDate, localTime, monthRange, todayIn } from '../lib/time.js';
 import { loadLocation } from '../lib/access.js';
 import { monthCharges } from './contractPricing.js';
@@ -30,6 +31,18 @@ export interface NewInvoice {
   notes?: string | undefined;
 }
 
+/** Refuses lines whose amounts, or whose total, could not be held exactly. Checked before anything is multiplied. */
+export function assertSafeLines(items: LineItem[]) {
+  let total = 0;
+  for (const i of items) {
+    if (!Number.isSafeInteger(i.quantity) || i.quantity < 1 || i.quantity > QUANTITY_MAX) throw badRequest('A line quantity must be a whole number from 1 to 10,000');
+    if (!Number.isSafeInteger(i.unitPriceCents) || Math.abs(i.unitPriceCents) > MONEY_MAX) throw badRequest('A line price is too large');
+    if (Math.abs(i.unitPriceCents) > INVOICE_MAX / i.quantity) throw badRequest('That line comes to more than an invoice can hold');
+    total += i.quantity * i.unitPriceCents;
+    if (Math.abs(total) > INVOICE_MAX) throw badRequest('That invoice comes to more than an invoice can hold');
+  }
+}
+
 export function calcTotals(items: LineItem[], taxRateBps: number) {
   const subtotalCents = items.reduce((s, i) => s + i.quantity * i.unitPriceCents, 0);
   const taxCents = Math.round((subtotalCents * taxRateBps) / 10_000);
@@ -38,6 +51,7 @@ export function calcTotals(items: LineItem[], taxRateBps: number) {
 
 export async function createInvoice(db: DbLike, input: NewInvoice): Promise<Invoice> {
   if (input.items.length === 0) throw badRequest('An invoice needs at least one line item');
+  assertSafeLines(input.items);
   const loc = await db.select().from(locations).where(eq(locations.id, input.locationId)).get();
   if (!loc) throw notFound('Location');
 
@@ -60,6 +74,7 @@ export async function createInvoice(db: DbLike, input: NewInvoice): Promise<Invo
       issueDate: input.issueDate,
       dueDate: input.dueDate,
       periodStart: input.periodStart ?? null,
+      taxRateBps: loc.taxRateBps,
       notes: input.notes ?? '',
       ...totals,
     })

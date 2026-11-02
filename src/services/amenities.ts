@@ -2,7 +2,7 @@ import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import { amenities, amenityOrders, amenityRequests, memberAmenities, members, users } from '../db/schema.js';
 import { loadLocation, loadMember } from '../lib/access.js';
-import { assertLocation, isStaff, type AuthUser } from '../lib/auth.js';
+import { assertLocation, assertSees, isStaff, type AuthUser } from '../lib/auth.js';
 import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
 import { addDays, todayIn } from '../lib/time.js';
 import { amenityItems, createInvoice } from './billing.js';
@@ -76,7 +76,7 @@ export async function amenityOwed(db: Db, memberId: string) {
 /** Records an amenity given to a member. The first ones of the day, up to their free amount, cost nothing; the rest are charged. */
 async function record(t: Db, actor: AuthUser, input: { memberId: string; amenityId: string; quantity: number }) {
   const { member } = await loadMember(t, input.memberId);
-  assertLocation(actor, member.locationId);
+  assertSees(actor, member.locationId, 'Member');
   if (member.status !== 'active') throw badRequest('Only active members can be given amenities');
   const amenity = await t.select().from(amenities).where(eq(amenities.id, input.amenityId)).get();
   if (!amenity || amenity.locationId !== member.locationId) throw notFound('Amenity');
@@ -98,7 +98,7 @@ export const giveAmenity = (db: Db, actor: AuthUser, input: { memberId: string; 
 /** Marks everything a member owes for amenities at the desk as collected. */
 export async function collectAmenities(db: Db, actor: AuthUser, memberId: string) {
   const { member } = await loadMember(db, memberId);
-  assertLocation(actor, member.locationId);
+  assertSees(actor, member.locationId, 'Member');
   const owed = await amenityOwed(db, member.id);
   if (owed <= 0) throw conflict('This member owes nothing for amenities');
   await db.update(amenityOrders).set({ collectedAt: new Date().toISOString() }).where(and(eq(amenityOrders.memberId, member.id), isNull(amenityOrders.collectedAt), isNull(amenityOrders.invoiceId))).run();
@@ -108,7 +108,7 @@ export async function collectAmenities(db: Db, actor: AuthUser, memberId: string
 /** Puts what a member owes for amenities on an invoice now, instead of waiting for the monthly invoices. */
 export async function invoiceAmenities(db: Db, actor: AuthUser, memberId: string) {
   const { member } = await loadMember(db, memberId);
-  assertLocation(actor, member.locationId);
+  assertSees(actor, member.locationId, 'Member');
   return db.transaction(async (tx) => {
     const t = tx as unknown as Db;
     const items = await amenityItems(t, [member.id]);
@@ -193,7 +193,7 @@ export async function listAmenityRequests(db: Db, actor: AuthUser, locationId: s
 async function loadRequest(db: Db, actor: AuthUser, id: string) {
   const r = await db.select().from(amenityRequests).where(eq(amenityRequests.id, id)).get();
   if (!r) throw notFound('Request');
-  assertLocation(actor, r.locationId);
+  assertSees(actor, r.locationId, 'Request');
   if (r.status !== 'pending') throw conflict(`This request is already ${r.status}`);
   return r;
 }

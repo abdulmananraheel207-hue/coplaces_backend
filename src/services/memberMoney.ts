@@ -2,7 +2,7 @@ import { and, desc, eq, lt, sql } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import { depositEntries, invoiceItems, invoices, locations, members, PAYMENT_METHODS } from '../db/schema.js';
 import { loadMember } from '../lib/access.js';
-import { assertLocation, type AuthUser } from '../lib/auth.js';
+import { assertLocation, assertSees, type AuthUser } from '../lib/auth.js';
 import { badRequest, conflict } from '../lib/errors.js';
 import { addDays, daysBetween, todayIn } from '../lib/time.js';
 import { loadLocation } from '../lib/access.js';
@@ -44,7 +44,8 @@ async function applyToOpenInvoice(t: Db, memberId: string) {
   if (!inv || inv.subtotalCents <= 0) return;
   const credit = Math.min(left, inv.subtotalCents);
   const loc = (await t.select().from(locations).where(eq(locations.id, inv.locationId)).get())!;
-  const totals = calcTotals([{ description: '', quantity: 1, unitPriceCents: inv.subtotalCents - credit }], loc.taxRateBps);
+  // The invoice keeps the tax rate it was issued at, even if the location's rate has changed since.
+  const totals = calcTotals([{ description: '', quantity: 1, unitPriceCents: inv.subtotalCents - credit }], inv.taxRateBps ?? loc.taxRateBps);
   await t.insert(invoiceItems).values({ invoiceId: inv.id, description: 'Advance paid', quantity: 1, unitPriceCents: -credit, amountCents: -credit }).run();
   await t.update(invoices).set({ ...totals, status: totals.totalCents === 0 ? 'paid' : 'open' }).where(eq(invoices.id, inv.id)).run();
   await t.update(members).set({ advanceUsedCents: m.advanceUsedCents + credit }).where(eq(members.id, memberId)).run();
@@ -53,7 +54,7 @@ async function applyToOpenInvoice(t: Db, memberId: string) {
 /** Records an advance and/or a security deposit as received now. Each can be taken once; the advance is taken off the period's open invoice. */
 export async function recordMemberMoney(t: Db, actor: AuthUser, memberId: string, input: MoneyInput) {
   const { member } = await loadMember(t, memberId);
-  assertLocation(actor, member.locationId);
+  assertSees(actor, member.locationId, 'Member');
   const advance = input.advanceCents ?? 0;
   const deposit = input.depositCents ?? 0;
   if (advance < 0 || deposit < 0) throw badRequest('Amounts cannot be negative');
@@ -88,7 +89,7 @@ export async function settleMemberDeposit(db: Db, actor: AuthUser, memberId: str
   return db.transaction(async (tx) => {
     const t = tx as unknown as Db;
     const { member } = await loadMember(t, memberId);
-    assertLocation(actor, member.locationId);
+    assertSees(actor, member.locationId, 'Member');
     if (member.depositStatus !== 'held') throw conflict('There is no security deposit being held');
     const today = todayIn((await loadLocation(t, member.locationId)).timezone);
     const open = member.status === 'active' && !!member.planEnd && daysBetween(today, member.planEnd) > SETTLE_DAYS_BEFORE;

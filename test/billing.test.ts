@@ -115,7 +115,7 @@ describe('invoices and payments', () => {
     const agent = await login(app, 'basic@test.dev');
     const list = await agent.get(`/api/invoices?locationId=${loc.id}`).expect(200);
     expect(list.body.map((i: { id: string }) => i.id)).toEqual([mine.body.id]);
-    await agent.get(`/api/invoices/${theirs.body.id}`).expect(403);
+    await agent.get(`/api/invoices/${theirs.body.id}`).expect(404); // someone else's invoice looks like one that does not exist
     await agent.get(`/api/invoices/${mine.body.id}`).expect(200);
     await agent.post('/api/invoices').send({ memberId: basic.member.id, items: [item('Free money', 0)] }).expect(403);
   });

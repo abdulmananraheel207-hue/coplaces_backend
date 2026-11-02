@@ -51,7 +51,7 @@ describe('auth and access control', () => {
     const { app, loc, basic } = await setup();
     const pro = await login(app, 'pro@test.dev');
     await pro.get(`/api/members?locationId=${loc.id}`).expect(403);
-    await pro.get(`/api/members/${basic.member.id}`).expect(403);
+    await pro.get(`/api/members/${basic.member.id}`).expect(404); // another member's record looks like one that does not exist
     await pro.get(`/api/expenses?locationId=${loc.id}`).expect(403);
     const summary = await pro.get('/api/me/summary').expect(200);
     expect(summary.body.plan.name).toBe('Pro');

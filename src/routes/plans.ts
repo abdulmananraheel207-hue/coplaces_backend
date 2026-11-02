@@ -9,12 +9,13 @@ import { requirePermission } from '../lib/permissions.js';
 import { notFound } from '../lib/errors.js';
 import { idParam } from '../lib/http.js';
 import { parse } from '../lib/validate.js';
+import { money } from '../lib/money.js';
 
 const fields = z.object({
   name: z.string().trim().min(1).max(100),
   description: z.string().trim().max(500),
   interval: z.enum(PLAN_INTERVALS),
-  priceCents: z.number().int().min(0),
+  priceCents: money,
   includedMeetingMinutes: z.number().int().min(0).max(100_000),
   includesHotDesk: z.boolean(),
   active: z.boolean(),

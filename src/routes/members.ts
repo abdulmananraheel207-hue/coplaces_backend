@@ -22,7 +22,7 @@ import {
   users,
 } from '../db/schema.js';
 import { assertMemberAccess, loadLocation, loadMember, requireLocationId } from '../lib/access.js';
-import { assertLocation, assertWithinLimit } from '../lib/auth.js';
+import { assertLocation, assertSees, assertWithinLimit } from '../lib/auth.js';
 import { requirePermission } from '../lib/permissions.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { DATE_RE, isValidDate, todayIn } from '../lib/time.js';
@@ -35,6 +35,7 @@ import { syncUser } from '../services/devices.js';
 import { idParam } from '../lib/http.js';
 import { tempPassword } from '../lib/passwords.js';
 import { parse } from '../lib/validate.js';
+import { money } from '../lib/money.js';
 
 const dateStr = z.string().refine(isValidDate, 'Use YYYY-MM-DD');
 /** The amenities a member gets free each day, and the meeting room credit hours (two make an hour) they get each month. */
@@ -124,8 +125,8 @@ export function membersRouter(db: Db) {
         shiftIds: z.array(z.string()).max(50).default([]),
         deskIds: z.array(z.string()).max(50).default([]),
         /** Paid when they join: the advance comes off the shift prices, and the deposit is held until the end of the plan period. */
-        advanceCents: z.number().int().min(0).max(1_000_000_000_000).default(0),
-        depositCents: z.number().int().min(0).max(1_000_000_000_000).default(0),
+        advanceCents: money.default(0),
+        depositCents: money.default(0),
         method: z.enum(PAYMENT_METHODS).default('cash'),
         reference: z.string().trim().max(100).default(''),
         amenities: freeAmenities.default([]),
@@ -215,14 +216,14 @@ export function membersRouter(db: Db) {
 
   /** Records an advance or a security deposit that was forgotten when the member was added. */
   r.post('/:id/money', requirePermission('members'), async (req, res) => {
-    const body = parse(z.object({ advanceCents: z.number().int().min(0).max(1_000_000_000_000).optional(), depositCents: z.number().int().min(0).max(1_000_000_000_000).optional(), method: z.enum(PAYMENT_METHODS).default('cash'), reference: z.string().trim().max(100).default('') }), req.body);
+    const body = parse(z.object({ advanceCents: money.optional(), depositCents: money.optional(), method: z.enum(PAYMENT_METHODS).default('cash'), reference: z.string().trim().max(100).default('') }), req.body);
     await db.transaction((tx) => recordMemberMoney(tx as unknown as Db, req.user!, idParam(req), body));
     res.status(204).end();
   });
 
   /** Settles the security deposit at the end of the plan period: some or all goes back, the rest is kept. */
   r.post('/:id/deposit', requirePermission('members'), async (req, res) => {
-    const body = parse(z.object({ action: z.enum(['refund', 'forfeit']), returnedCents: z.number().int().min(0).optional(), method: z.enum(PAYMENT_METHODS).default('cash'), reference: z.string().trim().max(100).default('') }), req.body);
+    const body = parse(z.object({ action: z.enum(['refund', 'forfeit']), returnedCents: money.optional(), method: z.enum(PAYMENT_METHODS).default('cash'), reference: z.string().trim().max(100).default('') }), req.body);
     res.json(await settleMemberDeposit(db, req.user!, idParam(req), body));
   });
 
@@ -300,7 +301,7 @@ export function membersRouter(db: Db) {
       req.body,
     );
     const { member, user } = await loadMember(db, idParam(req));
-    assertLocation(req.user!, member.locationId);
+    assertSees(req.user!, member.locationId, 'Member');
     if (body.planId !== undefined) await checkPlan(db, body.planId, member.locationId);
     if (member.status === 'cancelled' && body.status && body.status !== 'cancelled') await assertWithinLimit(db, req.user!, 'members');
     if (body.email && body.email !== user.email) {
@@ -347,7 +348,7 @@ export function membersRouter(db: Db) {
 
   r.post('/:id/reset-password', requirePermission('members'), async (req, res) => {
     const { member, user } = await loadMember(db, idParam(req));
-    assertLocation(req.user!, member.locationId);
+    assertSees(req.user!, member.locationId, 'Member');
     const temp = tempPassword();
     await db.update(users).set({ passwordHash: await bcrypt.hash(temp, 10) }).where(eq(users.id, user.id)).run();
     res.json({ tempPassword: temp });

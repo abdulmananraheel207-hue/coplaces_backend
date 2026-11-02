@@ -299,7 +299,7 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect(rep.deposits.heldCents).toBe(0);
   });
 
-  knownBug('T1: an advance applied later keeps the tax rate the invoice was issued at', async () => {
+  it('T1: an advance applied later keeps the tax rate the invoice was issued at', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     const p = await planWithShifts(ctx, owner);
@@ -310,14 +310,14 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect(bill).toMatchObject({ subtotalCents: 300_000, taxCents: 30_000, totalCents: 330_000 }); // today: 60,000 tax, at 20%
   });
 
-  knownBug('L4: a manual invoice whose total cannot be held exactly is refused', async () => {
+  it('L4: a manual invoice whose total cannot be held exactly is refused', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     const res = await owner.post('/api/invoices').send({ memberId: ctx.basic.member.id, items: [{ description: 'Huge', quantity: 10_000, unitPriceCents: Number.MAX_SAFE_INTEGER }] });
     expect(res.status).toBe(400);
   });
 
-  knownBug('S1: another tenant’s finance record ids answer 404, exactly like ids that do not exist', async () => {
+  it('S1: another tenant’s finance record ids answer 404, exactly like ids that do not exist', async () => {
     const ctx = await setup();
     await upgradeHive(ctx);
     const owner = await ownerOf(ctx);

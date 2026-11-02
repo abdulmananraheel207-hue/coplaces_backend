@@ -3,7 +3,7 @@ import { and, desc, eq, gte, lt } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import { PAYMENT_METHODS, invoices, members, payments, users } from '../db/schema.js';
 import { loadLocation, requireLocationId } from '../lib/access.js';
-import { assertLocation } from '../lib/auth.js';
+import { assertLocation, assertSees } from '../lib/auth.js';
 import { requirePermission } from '../lib/permissions.js';
 import { badRequest, notFound } from '../lib/errors.js';
 import { idParam, queryString } from '../lib/http.js';
@@ -49,7 +49,7 @@ export function paymentsRouter(db: Db) {
   r.delete('/:id', requirePermission('billing_admin'), async (req, res) => {
     const p = await db.select().from(payments).where(eq(payments.id, idParam(req))).get();
     if (!p) throw notFound('Payment');
-    assertLocation(req.user!, p.locationId);
+    assertSees(req.user!, p.locationId, 'Payment');
     res.json(await deletePayment(db, p.id));
   });
 

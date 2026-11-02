@@ -21,6 +21,7 @@ import { idParam } from '../lib/http.js';
 import { tempPassword } from '../lib/passwords.js';
 import { addDays, addMonthsToDate, daysBetween, isValidDate, isValidTimezone, monthRange, todayIn } from '../lib/time.js';
 import { parse } from '../lib/validate.js';
+import { positiveMoney } from '../lib/money.js';
 
 type Package = typeof packages.$inferSelect;
 type Organization = typeof organizations.$inferSelect;
@@ -300,7 +301,7 @@ export function platformRouter(db: Db) {
   r.post('/organizations/:id/payments', async (req, res) => {
     const body = parse(
       z.object({
-        amountCents: z.number().int().min(1),
+        amountCents: positiveMoney,
         method: z.enum(PAYMENT_METHODS),
         periods: z.number().int().min(1).max(36).default(1),
         reference: z.string().trim().max(200).default(''),

@@ -3,7 +3,7 @@ import { and, asc, eq, gt, inArray, isNull, lte, ne, or } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import { contractPeople, contractSpaces, contracts, members, resourceAssignments, resources, users } from '../db/schema.js';
 import { loadLocation } from '../lib/access.js';
-import { assertLocation, orgUsage, type AuthUser } from '../lib/auth.js';
+import { assertLocation, assertSees, orgUsage, type AuthUser } from '../lib/auth.js';
 import { HttpError, badRequest, conflict, notFound } from '../lib/errors.js';
 import { addDays, todayIn } from '../lib/time.js';
 import { monthlyTotal, type PricingTerms } from './contractPricing.js';
@@ -58,7 +58,7 @@ export const termsOf = (c: Contract): PricingTerms => ({
 async function load(db: Db, actor: AuthUser, id: string) {
   const c = await db.select().from(contracts).where(eq(contracts.id, id)).get();
   if (!c) throw notFound('Contract');
-  assertLocation(actor, c.locationId);
+  assertSees(actor, c.locationId, 'Contract');
   return c;
 }
 

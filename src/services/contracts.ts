@@ -2,7 +2,7 @@ import { and, eq, gt, gte, inArray, isNull, lt, lte, ne, or } from 'drizzle-orm'
 import type { Db } from '../db/client.js';
 import { bookings, contracts, resourceAssignments, resources } from '../db/schema.js';
 import { loadLocation, loadMember } from '../lib/access.js';
-import { assertLocation, type AuthUser } from '../lib/auth.js';
+import { assertLocation, assertSees, type AuthUser } from '../lib/auth.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { addDays, todayIn, zonedToUtc } from '../lib/time.js';
 import { activateCompany, endCompanyParts, syncContractPeople } from './companyContracts.js';
@@ -12,7 +12,7 @@ import { activateCompany, endCompanyParts, syncContractPeople } from './companyC
 export async function assignSpace(db: Db, actor: AuthUser, body: { resourceId: string; memberId: string; startDate: string; endDate: string | null }) {
   const resource = await db.select().from(resources).where(eq(resources.id, body.resourceId)).get();
   if (!resource) throw notFound('Resource');
-  assertLocation(actor, resource.locationId);
+  assertSees(actor, resource.locationId, 'Space');
   if (resource.status !== 'available') throw conflict(`${resource.name} is not available (${resource.status})`);
   const { member } = await loadMember(db, body.memberId);
   if (member.locationId !== resource.locationId) throw badRequest('Member belongs to a different location');
@@ -57,7 +57,7 @@ export async function assignSpace(db: Db, actor: AuthUser, body: { resourceId: s
 async function load(db: Db, actor: AuthUser, id: string) {
   const c = await db.select().from(contracts).where(eq(contracts.id, id)).get();
   if (!c) throw notFound('Contract');
-  assertLocation(actor, c.locationId);
+  assertSees(actor, c.locationId, 'Contract');
   return c;
 }
 

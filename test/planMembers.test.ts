@@ -232,7 +232,7 @@ describe('deleting a member', () => {
     const front = await login(ctx.app, 'front@test.dev'); // may check people in, but not change members
     await front.delete(`/api/members/${ctx.basic.member.id}`).expect(403);
     const hive = await login(ctx.app, 'owner@hive.dev');
-    await hive.delete(`/api/members/${ctx.basic.member.id}`).expect(403);
+    await hive.delete(`/api/members/${ctx.basic.member.id}`).expect(404); // another tenant's member looks like one that does not exist
   });
 });
 

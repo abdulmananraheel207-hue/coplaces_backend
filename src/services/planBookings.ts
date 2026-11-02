@@ -2,7 +2,7 @@ import { and, desc, eq, gt, gte, inArray, isNull, lt, lte, ne, or } from 'drizzl
 import type { Db } from '../db/client.js';
 import { bookings, invoices, locationHolidays, memberDesks, memberShifts, members, plans, resourceAssignments, resources, shiftSpaces, shiftTemplates } from '../db/schema.js';
 import { loadLocation } from '../lib/access.js';
-import { assertLocation, type AuthUser } from '../lib/auth.js';
+import { assertLocation, assertSees, type AuthUser } from '../lib/auth.js';
 import { advanceCredit } from './memberMoney.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { addDays, addMonthsToDate, businessDateOf, daysBetween, localDate, localTime, shiftWindow, spanMinutes, toMinutes, todayIn, zonedToUtc } from '../lib/time.js';
@@ -110,7 +110,7 @@ export async function freeSpaces(db: Db, locationId: string, shifts: Shift[], st
 export async function freeSpacesForPlan(db: Db, actor: AuthUser, planId: string, shiftIds: string[], start: string, exceptMemberId?: string) {
   const plan = await db.select().from(plans).where(eq(plans.id, planId)).get();
   if (!plan) throw notFound('Plan');
-  assertLocation(actor, plan.locationId);
+  assertSees(actor, plan.locationId, 'Plan');
   const shifts = await loadShifts(db, plan, shiftIds);
   return { end: periodEnd(plan.interval, start), spaces: await freeSpaces(db, plan.locationId, shifts, start, periodEnd(plan.interval, start), undefined, exceptMemberId) };
 }
@@ -185,7 +185,7 @@ export async function changePlan(db: Db, actor: AuthUser, memberId: string, inpu
     const t = tx as unknown as Db;
     const member = await t.select().from(members).where(eq(members.id, memberId)).get();
     if (!member) throw notFound('Member');
-    assertLocation(actor, member.locationId);
+    assertSees(actor, member.locationId, 'Member');
     if (member.status !== 'active') throw badRequest('Only active members can have their plan changed');
     const loc = await loadLocation(t, member.locationId);
     const today = todayIn(loc.timezone);
@@ -253,7 +253,7 @@ export function renewPlan(db: Db, actor: AuthUser, memberId: string, startDate?:
     const t = tx as unknown as Db;
     const member = await t.select().from(members).where(eq(members.id, memberId)).get();
     if (!member) throw notFound('Member');
-    assertLocation(actor, member.locationId);
+    assertSees(actor, member.locationId, 'Member');
     if (member.status !== 'active') throw badRequest('Only active members can renew');
     const plan = member.planId ? await t.select().from(plans).where(eq(plans.id, member.planId)).get() : null;
     const shiftIds = (await t.select({ id: memberShifts.shiftId }).from(memberShifts).where(eq(memberShifts.memberId, member.id)).all()).map((x) => x.id);

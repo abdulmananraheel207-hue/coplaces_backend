@@ -2,7 +2,7 @@ import { and, eq, inArray, ne, or, sql } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import { amenityOrders, amenityRequests, attendance, bookings, contractPeople, contracts, depositEntries, deviceUsers, devicePunches, invoiceItems, invoices, issues, memberDesks, memberShifts, members, payments, resourceAssignments, roomRequests, users, visitors } from '../db/schema.js';
 import { loadMember } from '../lib/access.js';
-import { assertLocation, type AuthUser } from '../lib/auth.js';
+import { assertLocation, assertSees, type AuthUser } from '../lib/auth.js';
 import { conflict } from '../lib/errors.js';
 import { syncUser } from './devices.js';
 
@@ -15,7 +15,7 @@ const count = async (q: PromiseLike<{ n: number }[]>) => (await q)[0]?.n ?? 0;
  */
 export async function deleteMember(db: Db, actor: AuthUser, memberId: string) {
   const { member, user } = await loadMember(db, memberId);
-  assertLocation(actor, member.locationId);
+  assertSees(actor, member.locationId, 'Member');
 
   const kept: string[] = [];
   const check = async (label: string, n: Promise<number>) => {

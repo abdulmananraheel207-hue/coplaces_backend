@@ -11,6 +11,7 @@ import { requirePermission } from '../lib/permissions.js';
 import { fitsBusinessHours, spanMinutes, TIME_RE } from '../lib/time.js';
 import { retimeShiftBookings } from '../services/planBookings.js';
 import { parse } from '../lib/validate.js';
+import { money } from '../lib/money.js';
 
 /** Rooms, desks and offices can have shifts. Lockers and parking cannot. */
 const BOOKABLE = ['room', 'corporate_room', 'hot_desk', 'dedicated_desk', 'office'] as const;
@@ -23,7 +24,7 @@ const fields = z.object({
   spaceIds: z.array(z.string()).max(500),
   startTime: timeStr,
   endTime: timeStr,
-  priceCents: z.number().int().min(0).nullable(),
+  priceCents: money.nullable(),
   active: z.boolean(),
 });
 

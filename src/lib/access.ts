@@ -2,7 +2,7 @@ import type { Request } from 'express';
 import { eq } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import { locations, members, users } from '../db/schema.js';
-import { assertLocation, isStaff, type AuthUser } from './auth.js';
+import { assertLocation, assertSees, isStaff, type AuthUser } from './auth.js';
 import { badRequest, forbidden, notFound } from './errors.js';
 
 export function requireLocationId(req: Request, source: 'query' | 'body' = 'query'): string {
@@ -31,6 +31,6 @@ export async function loadMember(db: Db, id: string) {
 
 /** Staff may touch members in their locations; a member only themself. */
 export function assertMemberAccess(user: AuthUser, member: { id: string; locationId: string }) {
-  if (isStaff(user)) assertLocation(user, member.locationId);
-  else if (user.memberId !== member.id) throw forbidden();
+  if (isStaff(user)) assertSees(user, member.locationId, 'Member');
+  else if (user.memberId !== member.id) throw notFound('Member');
 }

@@ -23,7 +23,7 @@ describe('tenant isolation', () => {
       await hive.get(`/api/reports/dashboard?locationId=${id}`).expect(403);
       await hive.patch(`/api/locations/${id}`).send({ name: 'Hijacked' }).expect(403);
     }
-    await hive.get(`/api/members/${basic.member.id}`).expect(403);
+    await hive.get(`/api/members/${basic.member.id}`).expect(404); // another tenant's ids look like ids that do not exist
     await hive
       .post('/api/bookings')
       .send({ resourceId: room.id, memberId: basic.member.id, date: tomorrow(), startTime: '10:00', endTime: '11:00' })
@@ -58,7 +58,7 @@ describe('tenant isolation', () => {
     const ib = await b.post('/api/invoices').send({ memberId: hiveMember.member.id, items: item }).expect(201);
     expect(ia.body.number).toBe('DTN-00001');
     expect(ib.body.number).toBe('DTN-00001');
-    await a.get(`/api/invoices/${ib.body.id}`).expect(403);
+    await a.get(`/api/invoices/${ib.body.id}`).expect(404);
   });
 
   it('keeps platform and tenant APIs apart', async () => {

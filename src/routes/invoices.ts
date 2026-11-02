@@ -4,12 +4,13 @@ import { z } from 'zod';
 import type { Db } from '../db/client.js';
 import { invoiceItems, invoices, members, payments, users } from '../db/schema.js';
 import { assertMemberAccess, loadLocation, loadMember, requireLocationId } from '../lib/access.js';
-import { assertLocation, isStaff } from '../lib/auth.js';
+import { assertLocation, assertSees, isStaff } from '../lib/auth.js';
 import { assertCan, requirePermission } from '../lib/permissions.js';
 import { badRequest, forbidden, notFound } from '../lib/errors.js';
 import { idParam, queryString } from '../lib/http.js';
 import { addDays, isValidDate, MONTH_RE, todayIn } from '../lib/time.js';
 import { parse } from '../lib/validate.js';
+import { money, paymentAmount, QUANTITY_MAX } from '../lib/money.js';
 import { createInvoice, generateSubscriptionInvoices, recordPayment, voidInvoice, withBalance } from '../services/billing.js';
 import { PAYMENT_METHODS } from '../db/schema.js';
 
@@ -58,8 +59,8 @@ export function invoicesRouter(db: Db) {
     const user = req.user!;
     if (isStaff(user)) {
       assertCan(user, 'invoices');
-      assertLocation(user, inv.locationId);
-    } else if (user.memberId !== inv.memberId) throw forbidden();
+      assertSees(user, inv.locationId, 'Invoice');
+    } else if (user.memberId !== inv.memberId) throw notFound('Invoice');
 
     const loc = await loadLocation(db, inv.locationId);
     const { member, user: memberUser } = await loadMember(db, inv.memberId);
@@ -87,8 +88,8 @@ export function invoicesRouter(db: Db) {
           .array(
             z.object({
               description: z.string().trim().min(1).max(200),
-              quantity: z.number().int().min(1).max(10_000).default(1),
-              unitPriceCents: z.number().int().min(0),
+              quantity: z.number().int().min(1).max(QUANTITY_MAX).default(1),
+              unitPriceCents: money,
             }),
           )
           .min(1)
@@ -97,7 +98,7 @@ export function invoicesRouter(db: Db) {
       req.body,
     );
     const { member } = await loadMember(db, body.memberId);
-    assertLocation(req.user!, member.locationId);
+    assertSees(req.user!, member.locationId, 'Member');
     const loc = await loadLocation(db, member.locationId);
     const issueDate = body.issueDate ?? todayIn(loc.timezone);
     const dueDate = body.dueDate ?? addDays(issueDate, 14);
@@ -126,14 +127,14 @@ export function invoicesRouter(db: Db) {
   r.post('/:id/void', requirePermission('billing_admin'), async (req, res) => {
     const inv = await db.select().from(invoices).where(eq(invoices.id, idParam(req))).get();
     if (!inv) throw notFound('Invoice');
-    assertLocation(req.user!, inv.locationId);
+    assertSees(req.user!, inv.locationId, 'Invoice');
     res.json(await voidInvoice(db, inv.id));
   });
 
   r.post('/:id/payments', requirePermission('invoices'), async (req, res) => {
     const body = parse(
       z.object({
-        amountCents: z.number().int().min(1),
+        amountCents: paymentAmount,
         method: z.enum(PAYMENT_METHODS),
         paidAt: z.iso.datetime().optional(),
         reference: z.string().trim().max(200).default(''),
@@ -143,7 +144,7 @@ export function invoicesRouter(db: Db) {
     );
     const inv = await db.select().from(invoices).where(eq(invoices.id, idParam(req))).get();
     if (!inv) throw notFound('Invoice');
-    assertLocation(req.user!, inv.locationId);
+    assertSees(req.user!, inv.locationId, 'Invoice');
     const out = await recordPayment(db, {
       invoiceId: inv.id,
       amountCents: body.amountCents,

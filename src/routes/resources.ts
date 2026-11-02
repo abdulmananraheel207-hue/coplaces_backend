@@ -12,6 +12,7 @@ import { idParam, queryString } from '../lib/http.js';
 import { isValidDate, TIME_RE, todayIn } from '../lib/time.js';
 import { byName } from '../lib/sort.js';
 import { parse } from '../lib/validate.js';
+import { money } from '../lib/money.js';
 import { assertFloorsWithinLimit } from '../services/floors.js';
 import { assignSpace } from '../services/contracts.js';
 import { assertRetirable } from '../services/floorplan.js';
@@ -128,7 +129,7 @@ export function resourcesRouter(db: Db) {
     const body = parse(
       z.object({
         locationId: z.string(),
-        prices: z.array(z.object({ resourceId: z.string(), hourlyRateCents: z.number().int().min(0).max(1_000_000_000_000) })).min(1).max(1000),
+        prices: z.array(z.object({ resourceId: z.string(), hourlyRateCents: money })).min(1).max(1000),
       }),
       req.body,
     );

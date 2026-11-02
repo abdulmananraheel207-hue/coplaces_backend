@@ -4,17 +4,18 @@ import { z } from 'zod';
 import type { Db } from '../db/client.js';
 import { EXPENSE_CATEGORIES, expenses } from '../db/schema.js';
 import { loadLocation, requireLocationId } from '../lib/access.js';
-import { assertLocation } from '../lib/auth.js';
+import { assertLocation, assertSees } from '../lib/auth.js';
 import { badRequest, notFound } from '../lib/errors.js';
 import { idParam, queryString } from '../lib/http.js';
 import { isValidDate, todayIn } from '../lib/time.js';
 import { parse } from '../lib/validate.js';
+import { positiveMoney } from '../lib/money.js';
 
 const fields = z.object({
   category: z.enum(EXPENSE_CATEGORIES),
   vendor: z.string().trim().max(120),
   description: z.string().trim().max(300),
-  amountCents: z.number().int().min(1),
+  amountCents: positiveMoney,
   incurredOn: z.string().refine(isValidDate, 'Use YYYY-MM-DD'),
 });
 
@@ -67,14 +68,14 @@ export function expensesRouter(db: Db) {
     const body = parse(fields.partial(), req.body);
     const e = await db.select().from(expenses).where(eq(expenses.id, idParam(req))).get();
     if (!e) throw notFound('Expense');
-    assertLocation(req.user!, e.locationId);
+    assertSees(req.user!, e.locationId, 'Expense');
     res.json(await db.update(expenses).set(body).where(eq(expenses.id, e.id)).returning().get());
   });
 
   r.delete('/:id', async (req, res) => {
     const e = await db.select().from(expenses).where(eq(expenses.id, idParam(req))).get();
     if (!e) throw notFound('Expense');
-    assertLocation(req.user!, e.locationId);
+    assertSees(req.user!, e.locationId, 'Expense');
     await db.delete(expenses).where(eq(expenses.id, e.id)).run();
     res.status(204).end();
   });

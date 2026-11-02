@@ -5,7 +5,7 @@ import { config } from '../config.js';
 import type { Db } from '../db/client.js';
 import { locations, members, organizations, packages, userLocations, users } from '../db/schema.js';
 import { parseFeatures, type FeatureKey } from '../features.js';
-import { forbidden, HttpError, unauthorized } from './errors.js';
+import { forbidden, HttpError, notFound, unauthorized } from './errors.js';
 import { resolvePermissions, type Permission } from './permissions.js';
 import { todayIn } from './time.js';
 
@@ -199,6 +199,14 @@ export const isManagerUp = (u: AuthUser) => u.role === 'owner' || u.role === 'ma
 
 export function assertLocation(user: AuthUser, locationId: string) {
   if (!user.locationIds.includes(locationId)) throw forbidden('No access to this location');
+}
+
+/**
+ * For a record the caller named by id: one in a location they cannot see is reported exactly like one that does not exist, so ids
+ * of other tenants and locations reveal nothing. (`assertLocation` stays for a location the caller asks for by id: that is a 403.)
+ */
+export function assertSees(user: AuthUser, locationId: string, what = 'Record') {
+  if (!user.locationIds.includes(locationId)) throw notFound(what);
 }
 
 export interface OrgUsage {
