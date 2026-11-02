@@ -187,18 +187,20 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     }
   });
 
-  knownBug('M3: amenity money collected at the desk is a payment with a method, so payments by method reconcile', async () => {
+  it('M3: amenity money collected at the desk is a payment with a method, so payments by method reconcile', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     const tea = (await owner.post('/api/amenities').send({ locationId: ctx.loc.id, name: 'Tea', priceCents: 200 }).expect(201)).body;
     await owner.post('/api/amenities/orders').send({ memberId: ctx.basic.member.id, amenityId: tea.id, quantity: 2 }).expect(201);
-    await owner.post('/api/amenities/collect').send({ memberId: ctx.basic.member.id, method: 'cash' }).expect(200);
+    // Collected at the desk is a receipt like any other money in: an invoice (taxed like every invoice, 400 + 10%) paid in cash.
+    const got = (await owner.post('/api/amenities/collect').send({ memberId: ctx.basic.member.id, method: 'cash' }).expect(200)).body;
+    expect(got.collectedCents).toBe(440);
     const rep = await financeReport(owner, ctx.loc.id, `${today().slice(0, 7)}-01`, today());
-    expect(rep.totals.collectedCents).toBe(400);
-    expect(sum(rep.paymentsByMethod.map((m: { amountCents: number }) => m.amountCents))).toBe(400);
+    expect(rep.totals.collectedCents).toBe(440);
+    expect(rep.paymentsByMethod).toEqual([{ method: 'cash', amountCents: 440 }]);
   });
 
-  knownBug('M4a: someone with only the members permission cannot bill a plan change', async () => {
+  it('M4a: someone with only the members permission cannot bill a plan change', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     const p = await planWithShifts(ctx, owner);
@@ -208,7 +210,7 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect(res.status).toBe(403); // today: 200, and an invoice is voided and another created
   });
 
-  knownBug('M4b: someone with only the members permission cannot take or refund money', async () => {
+  it('M4b: someone with only the members permission cannot take or refund money', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     const clerk = await staffWith(ctx, owner, 'clerk@test.dev', ['members']);
@@ -219,7 +221,7 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect([take.status, refund.status]).toEqual([403, 403]);
   });
 
-  knownBug('M5a: amenities cannot be put on an invoice when the package has no invoicing', async () => {
+  it('M5a: amenities cannot be put on an invoice when the package has no invoicing', async () => {
     const ctx = await setup();
     const hive = await login(ctx.app, 'owner@hive.dev'); // Hive's package has no features at all
     const tea = (await hive.post('/api/amenities').send({ locationId: ctx.locB.id, name: 'Tea', priceCents: 100 }).expect(201)).body;
@@ -239,7 +241,7 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect(await ctx.db.select().from(invoices).where(eq(invoices.locationId, ctx.locB.id)).all()).toHaveLength(0);
   });
 
-  knownBug('M6: deleting a member never erases an invoice that was issued', async () => {
+  it('M6: deleting a member never erases an invoice that was issued', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     const { member } = await ctx.member('mistake@test.dev', null);

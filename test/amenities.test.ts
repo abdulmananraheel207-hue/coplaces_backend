@@ -76,9 +76,10 @@ describe('amenities', () => {
     await desk.post('/api/amenities/collect').send({ memberId: ctx.basic.member.id }).expect(409); // nothing left to collect
     expect((await pro.get('/api/me/summary').expect(200)).body.amenityDueCents).toBe(0);
     f = await finance();
-    expect(f.amenities).toMatchObject({ owedCents: 0, collectedCents: 600, owedBy: [] });
-    expect(f.totals.collectedCents).toBe(600);
-    expect(f.incomeByKind).toContainEqual({ kind: 'amenities', amountCents: 600 });
+    // Paid at the desk is a receipt: an invoice for the 600 (+10% tax) and a cash payment on it.
+    expect(f.amenities).toMatchObject({ owedCents: 0, owedBy: [] });
+    expect(f.totals.collectedCents).toBe(660);
+    expect(f.paymentsByMethod).toEqual([{ method: 'cash', amountCents: 660 }]);
   });
 
   it('keeps the history when an amenity is removed, and stops a member who was given amenities from being deleted', async () => {

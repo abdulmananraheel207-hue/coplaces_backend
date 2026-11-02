@@ -2,10 +2,11 @@ import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import { amenities, amenityOrders, amenityRequests, memberAmenities, members, users } from '../db/schema.js';
 import { loadLocation, loadMember } from '../lib/access.js';
-import { assertLocation, assertSees, isStaff, type AuthUser } from '../lib/auth.js';
+import { assertLocation, assertSees, hasFeature, isStaff, type AuthUser } from '../lib/auth.js';
 import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
 import { addDays, todayIn } from '../lib/time.js';
-import { amenityItems, createInvoice } from './billing.js';
+import { amenityItems, createInvoice, recordPayment, type PaymentMethod } from './billing.js';
+import { audit } from './audit.js';
 
 /**
  * Amenities the owner hands out (tea, coffee, food). Each member can get some free every day; anything beyond that is charged at
@@ -95,14 +96,34 @@ async function record(t: Db, actor: AuthUser, input: { memberId: string; amenity
 
 export const giveAmenity = (db: Db, actor: AuthUser, input: { memberId: string; amenityId: string; quantity: number }) => db.transaction((tx) => record(tx as unknown as Db, actor, input));
 
-/** Marks everything a member owes for amenities at the desk as collected. */
-export async function collectAmenities(db: Db, actor: AuthUser, memberId: string) {
+/**
+ * The member pays at the desk for everything they owe for amenities.
+ *
+ * With invoicing in the package it is a receipt like any other money in: an invoice for what is owed (taxed like every invoice) and a
+ * payment on it with the method used, in one transaction. So it shows in the payment list, in payments by method and in the audit log,
+ * and can be reversed. Without invoicing the orders are only marked collected (and audited).
+ */
+export async function collectAmenities(db: Db, actor: AuthUser, memberId: string, input: { method: PaymentMethod; reference: string } = { method: 'cash', reference: '' }) {
   const { member } = await loadMember(db, memberId);
   assertSees(actor, member.locationId, 'Member');
-  const owed = await amenityOwed(db, member.id);
-  if (owed <= 0) throw conflict('This member owes nothing for amenities');
-  await db.update(amenityOrders).set({ collectedAt: new Date().toISOString() }).where(and(eq(amenityOrders.memberId, member.id), isNull(amenityOrders.collectedAt), isNull(amenityOrders.invoiceId))).run();
-  return { collectedCents: owed };
+  return db.transaction(async (tx) => {
+    const t = tx as unknown as Db;
+    const loc = await loadLocation(t, member.locationId);
+    if (hasFeature(actor, 'invoicing')) {
+      const items = await amenityItems(t, [member.id]);
+      if (!items.length) throw conflict('This member owes nothing for amenities');
+      const today = todayIn(loc.timezone);
+      const inv = await createInvoice(t, { locationId: loc.id, memberId: member.id, kind: 'manual', issueDate: today, dueDate: today, items, notes: 'Paid at the desk: tea, coffee and food beyond the free amount', actorId: actor.id });
+      const { payment } = await recordPayment(t, { invoiceId: inv.id, amountCents: inv.totalCents, method: input.method, paidAt: new Date().toISOString(), reference: input.reference, notes: 'Collected at the desk', recordedById: actor.id });
+      await audit(t, { organizationId: loc.organizationId, locationId: loc.id, actorId: actor.id, action: 'amenities.collect', entity: 'member', entityId: member.id, amountCents: inv.totalCents, data: { invoiceId: inv.id, number: inv.number, paymentId: payment.id, method: input.method } });
+      return { collectedCents: inv.totalCents, invoiceId: inv.id, paymentId: payment.id };
+    }
+    const owed = await amenityOwed(t, member.id);
+    if (owed <= 0) throw conflict('This member owes nothing for amenities');
+    await t.update(amenityOrders).set({ collectedAt: new Date().toISOString() }).where(and(eq(amenityOrders.memberId, member.id), isNull(amenityOrders.collectedAt), isNull(amenityOrders.invoiceId))).run();
+    await audit(t, { organizationId: loc.organizationId, locationId: loc.id, actorId: actor.id, action: 'amenities.collect', entity: 'member', entityId: member.id, amountCents: owed, data: { method: input.method, withoutInvoice: true } });
+    return { collectedCents: owed, invoiceId: null, paymentId: null };
+  });
 }
 
 /** Puts what a member owes for amenities on an invoice now, instead of waiting for the monthly invoices. */
@@ -114,7 +135,7 @@ export async function invoiceAmenities(db: Db, actor: AuthUser, memberId: string
     const items = await amenityItems(t, [member.id]);
     if (!items.length) throw conflict('This member owes nothing for amenities');
     const today = todayIn((await loadLocation(t, member.locationId)).timezone);
-    return createInvoice(t, { locationId: member.locationId, memberId: member.id, kind: 'manual', issueDate: today, dueDate: addDays(today, 7), items, notes: 'Tea, coffee and food beyond the free amount' });
+    return createInvoice(t, { locationId: member.locationId, memberId: member.id, kind: 'manual', issueDate: today, dueDate: addDays(today, 7), items, notes: 'Tea, coffee and food beyond the free amount', actorId: actor.id });
   });
 }
 

@@ -30,16 +30,12 @@ export async function deleteMember(db: Db, actor: AuthUser, memberId: string) {
   await check('assigned spaces', count(db.select({ n: sql<number>`count(*)` }).from(resourceAssignments).where(eq(resourceAssignments.memberId, member.id)).all()));
   await check('visitors', count(db.select({ n: sql<number>`count(*)` }).from(visitors).where(eq(visitors.hostMemberId, member.id)).all()));
   await check('reported problems', count(db.select({ n: sql<number>`count(*)` }).from(issues).where(eq(issues.reportedById, user.id)).all()));
-  await check('invoices that were paid or settled', count(db.select({ n: sql<number>`count(*)` }).from(invoices).where(and(eq(invoices.memberId, member.id), or(ne(invoices.status, 'open'), sql`${invoices.paidCents} > 0`))).all()));
+  // An invoice that was issued keeps its number and its member for good; void it and cancel the membership instead.
+  await check('invoices', count(db.select({ n: sql<number>`count(*)` }).from(invoices).where(eq(invoices.memberId, member.id)).all()));
   if (kept.length) throw conflict(`${user.name} has ${kept.join(', ')}, which have to be kept. Cancel their membership instead: they lose access and the records stay.`);
 
   await db.transaction(async (tx) => {
     const t = tx as unknown as Db;
-    const unpaid = (await t.select({ id: invoices.id }).from(invoices).where(eq(invoices.memberId, member.id)).all()).map((i) => i.id);
-    if (unpaid.length) {
-      await t.delete(invoiceItems).where(inArray(invoiceItems.invoiceId, unpaid)).run();
-      await t.delete(invoices).where(inArray(invoices.id, unpaid)).run();
-    }
     await t.delete(bookings).where(eq(bookings.memberId, member.id)).run();
     await t.delete(roomRequests).where(eq(roomRequests.memberId, member.id)).run();
     await t.delete(amenityRequests).where(eq(amenityRequests.memberId, member.id)).run();

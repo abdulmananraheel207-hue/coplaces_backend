@@ -5,7 +5,7 @@ import type { Db } from '../db/client.js';
 import { CONTRACT_STATUSES, PAYMENT_METHODS, PRICING_MODES, bookings, contractPeople, contractSpaces, contracts, depositEntries, members, resourceAssignments, resources, users } from '../db/schema.js';
 import { loadMember, requireLocationId } from '../lib/access.js';
 import { assertLocation, assertSees } from '../lib/auth.js';
-import { requirePermission } from '../lib/permissions.js';
+import { assertCan, requirePermission } from '../lib/permissions.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { idParam, queryString } from '../lib/http.js';
 import { isValidDate } from '../lib/time.js';
@@ -327,6 +327,8 @@ export function contractsRouter(db: Db) {
         await entry('received', c.depositCents);
         return tx.update(contracts).set({ depositStatus: 'held' }).where(eq(contracts.id, c.id)).returning().get();
       }
+      // Giving money back, or keeping it, is a billing control.
+      assertCan(user, 'billing_admin');
       if (c.depositStatus !== 'held') throw conflict('There is no security deposit being held');
       if (c.status === 'active' || c.status === 'draft') throw conflict('End the contract before settling its security deposit');
       const returned = body.action === 'forfeit' ? 0 : (body.returnedCents ?? c.depositCents);

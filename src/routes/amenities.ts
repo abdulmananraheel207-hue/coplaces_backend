@@ -2,9 +2,9 @@ import { Router } from 'express';
 import { and, asc, eq, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import type { Db } from '../db/client.js';
-import { amenities, amenityOrders } from '../db/schema.js';
+import { PAYMENT_METHODS, amenities, amenityOrders } from '../db/schema.js';
 import { requireLocationId } from '../lib/access.js';
-import { assertLocation, isStaff } from '../lib/auth.js';
+import { assertLocation, isStaff, requireFeature } from '../lib/auth.js';
 import { notFound } from '../lib/errors.js';
 import { idParam, queryString } from '../lib/http.js';
 import { assertCan, requirePermission } from '../lib/permissions.js';
@@ -60,7 +60,7 @@ export function amenitiesRouter(db: Db) {
   });
 
   /** Put what a member owes for amenities on an invoice now. */
-  r.post('/invoice', requirePermission('invoices'), async (req, res) => {
+  r.post('/invoice', requireFeature('invoicing'), requirePermission('invoices'), async (req, res) => {
     const body = parse(z.object({ memberId: z.string() }), req.body);
     res.status(201).json(await invoiceAmenities(db, req.user!, body.memberId));
   });
@@ -92,8 +92,8 @@ export function amenitiesRouter(db: Db) {
 
   /** The member paid what they owe for amenities. */
   r.post('/collect', requirePermission('front_desk', 'invoices'), async (req, res) => {
-    const body = parse(z.object({ memberId: z.string() }), req.body);
-    res.json(await collectAmenities(db, req.user!, body.memberId));
+    const body = parse(z.object({ memberId: z.string(), method: z.enum(PAYMENT_METHODS).default('cash'), reference: z.string().trim().max(100).default('') }), req.body);
+    res.json(await collectAmenities(db, req.user!, body.memberId, { method: body.method, reference: body.reference }));
   });
 
   return r;

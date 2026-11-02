@@ -22,8 +22,8 @@ import {
   users,
 } from '../db/schema.js';
 import { assertMemberAccess, loadLocation, loadMember, requireLocationId } from '../lib/access.js';
-import { assertLocation, assertSees, assertWithinLimit } from '../lib/auth.js';
-import { requirePermission } from '../lib/permissions.js';
+import { assertLocation, assertSees, assertWithinLimit, hasFeature } from '../lib/auth.js';
+import { assertCan, requirePermission } from '../lib/permissions.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { DATE_RE, isValidDate, todayIn } from '../lib/time.js';
 import { finishBookingOnCheckOut } from '../services/checkin.js';
@@ -144,6 +144,9 @@ export function membersRouter(db: Db) {
     if (body.deskIds.length && !body.shiftIds.length) throw badRequest('Choose the shifts the desks are for');
     if (body.shiftIds.length && body.status !== 'active') throw badRequest('Start the member as Active to give them shifts');
     if (body.status !== 'cancelled') await assertWithinLimit(db, req.user!, 'members');
+    // Taking money, or starting a plan that bills, needs the invoices permission as well as members.
+    if (body.advanceCents || body.depositCents) assertCan(req.user!, 'invoices');
+    if (body.shiftIds.length && hasFeature(req.user!, 'invoicing')) assertCan(req.user!, 'invoices');
     if (await db.select().from(users).where(eq(users.email, body.email)).get()) throw conflict('That email is already in use');
 
     const password = body.password ?? tempPassword();
@@ -205,6 +208,7 @@ export function membersRouter(db: Db) {
   /** Changes a member's plan, shifts or desks, re-booking what has not happened yet. */
   r.put('/:id/plan', requirePermission('members'), async (req, res) => {
     const body = parse(z.object({ planId: z.string().nullable(), shiftIds: z.array(z.string()).max(50).default([]), deskIds: z.array(z.string()).max(50).default([]), startDate: dateStr.optional() }), req.body);
+    if (hasFeature(req.user!, 'invoicing')) assertCan(req.user!, 'invoices'); // it voids and makes invoices
     res.json(await changePlan(db, req.user!, idParam(req), { planId: body.planId, shiftIds: body.shiftIds, spaceIds: body.deskIds, startDate: body.startDate }));
   });
 
@@ -217,6 +221,7 @@ export function membersRouter(db: Db) {
   /** Records an advance or a security deposit that was forgotten when the member was added. */
   r.post('/:id/money', requirePermission('members'), async (req, res) => {
     const body = parse(z.object({ advanceCents: money.optional(), depositCents: money.optional(), method: z.enum(PAYMENT_METHODS).default('cash'), reference: z.string().trim().max(100).default('') }), req.body);
+    assertCan(req.user!, 'invoices'); // taking money
     await db.transaction((tx) => recordMemberMoney(tx as unknown as Db, req.user!, idParam(req), body));
     res.status(204).end();
   });
@@ -224,11 +229,13 @@ export function membersRouter(db: Db) {
   /** Settles the security deposit at the end of the plan period: some or all goes back, the rest is kept. */
   r.post('/:id/deposit', requirePermission('members'), async (req, res) => {
     const body = parse(z.object({ action: z.enum(['refund', 'forfeit']), returnedCents: money.optional(), method: z.enum(PAYMENT_METHODS).default('cash'), reference: z.string().trim().max(100).default('') }), req.body);
+    assertCan(req.user!, 'billing_admin'); // giving money back, or keeping it, is a billing control
     res.json(await settleMemberDeposit(db, req.user!, idParam(req), body));
   });
 
   r.post('/:id/renew', requirePermission('members'), async (req, res) => {
     const body = parse(z.object({ startDate: dateStr.optional() }), req.body);
+    if (hasFeature(req.user!, 'invoicing')) assertCan(req.user!, 'invoices'); // it makes an invoice
     res.json(await renewPlan(db, req.user!, idParam(req), body.startDate));
   });
 

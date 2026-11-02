@@ -1,6 +1,6 @@
 import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
-import { attendance, bookings, invoiceItems, invoices, locations, memberDesks, memberShifts, members, resources, users } from '../src/db/schema.js';
+import { attendance, bookings, invoiceItems, invoices, locations, memberDesks, memberShifts, members, resources, shiftTemplates, users } from '../src/db/schema.js';
 import { addDays, localDate } from '../src/lib/time.js';
 import { inDays, login, setup, TZ } from './helpers.js';
 
@@ -202,6 +202,8 @@ describe('deleting a member', () => {
   it('removes a member added by mistake with everything made for them, and frees the email and the desk', async () => {
     const ctx = await setup();
     const p = await planWithShifts(ctx);
+    // Shifts without a price, so no invoice is issued: a member with an invoice is never deleted (see the next test).
+    await ctx.db.update(shiftTemplates).set({ priceCents: null }).where(eq(shiftTemplates.planId, p.plan.id)).run();
     const mem = (await newMember(ctx, p).expect(201)).body;
     await p.owner.delete(`/api/members/${mem.id}`).expect(204);
     expect(await ctx.db.select().from(members).where(eq(members.id, mem.id)).get()).toBeUndefined();
@@ -222,10 +224,11 @@ describe('deleting a member', () => {
     expect(JSON.stringify(r.body)).toMatch(/check-ins.*Cancel their membership instead/);
     expect(await ctx.db.select().from(members).where(eq(members.id, mem.id)).get()).toBeTruthy();
 
-    // a paid invoice is kept too
+    // any invoice is kept too, paid or not: it keeps its number and its member
     const other = (await newMember(ctx, p, { email: 'paid@x.dev', deskIds: [p.desks[1]!.id] }).expect(201)).body;
-    await ctx.db.update(invoices).set({ paidCents: 500_000, status: 'paid' }).where(eq(invoices.memberId, other.id)).run();
-    await p.owner.delete(`/api/members/${other.id}`).expect(409);
+    const r2 = await p.owner.delete(`/api/members/${other.id}`).expect(409);
+    expect(JSON.stringify(r2.body)).toMatch(/invoices/);
+    expect(await ctx.db.select().from(invoices).where(eq(invoices.memberId, other.id)).all()).toHaveLength(1);
   });
 
   it('needs the members permission and the right location', async () => {
