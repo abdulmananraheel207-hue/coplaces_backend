@@ -121,3 +121,25 @@ export const rows = {
 };
 
 export { setup, TZ, inDays };
+
+/**
+ * The tax inside a set of payments, worked out here independently of the application: each invoice's tax shared over its payments on
+ * the running total paid (so an invoice paid in full carries exactly its tax). Only payments `keep` accepts are counted.
+ */
+export function taxInside(
+  invs: { id: string; totalCents: number; taxCents: number }[],
+  pays: { id: string; invoiceId: string; amountCents: number; paidAt: string; createdAt: string }[],
+  keep: (p: { paidAt: string }) => boolean = () => true,
+) {
+  let tax = 0;
+  for (const i of invs) {
+    let paid = 0;
+    const taxOf = (x: number) => (i.totalCents > 0 ? Math.round((Math.min(x, i.totalCents) * i.taxCents) / i.totalCents) : 0);
+    for (const p of pays.filter((x) => x.invoiceId === i.id).sort((a, b) => a.paidAt.localeCompare(b.paidAt) || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))) {
+      const before = taxOf(paid);
+      paid += p.amountCents;
+      if (keep(p)) tax += taxOf(Math.max(0, paid)) - before;
+    }
+  }
+  return tax;
+}

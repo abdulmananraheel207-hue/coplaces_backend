@@ -3,9 +3,8 @@ import { daysBetween, localDate } from '../lib/time.js';
 /**
  * The finance definitions in one place, as pure functions over plain rows: no database, no clock, no request.
  *
- * STAGE 1A SCAFFOLD. Nothing calls these yet; reports.ts, the dashboard, a member's balance and /me/summary still compute their own
- * figures. test/financeCore.test.ts proves each function here returns exactly what the endpoint returns today (characterization), and
- * documents where a definition differs from what is right. The fixes in later stages move the endpoints onto these functions.
+ * The finance report, the Today page and the finance charts compute every figure with these functions, from the rows
+ * financeBooks.ts loads, so they cannot disagree. test/financeCore.test.ts proves the endpoints return what these functions return.
  *
  * Conventions: money in integer minor units; `day` is 'YYYY-MM-DD' in the location's timezone; instants are ISO UTC strings.
  */
@@ -28,13 +27,18 @@ export interface InvoiceRow {
 export interface InvoiceLineRow {
   invoiceId: string;
   amountCents: number;
+  category?: string;
+  resourceId?: string | null;
+  planId?: string | null;
 }
 
 export interface PaymentRow {
+  id?: string;
   invoiceId: string;
   amountCents: number;
   method: string;
   paidAt: string;
+  createdAt?: string;
 }
 
 export interface LedgerRow {
@@ -79,10 +83,14 @@ export const taxInvoicedCents = (invoices: InvoiceRow[], days: DayRange) => sum(
 /** What the finance report and the dashboard call "invoiced": non-void invoice totals by issue date. Net of any advance line (R1). */
 export const invoicedCents = (invoices: InvoiceRow[], days: DayRange) => sum(invoices.filter((i) => live(i) && inDays(i.issueDate, days)).map((i) => i.totalCents));
 
-/** What members were billed including the part an advance paid (the negative "Advance paid" lines added back). The R1 definition. */
+/**
+ * What members were billed: invoice totals including the part an advance paid (the "Advance paid" lines added back), since the advance
+ * itself is counted as money in when it arrives. Credit lines are not added back: that money was billed on an earlier invoice.
+ * This is what the finance report and the Today page call "invoiced".
+ */
 export function billedCents(invoices: InvoiceRow[], lines: InvoiceLineRow[], days: DayRange) {
   const counted = new Set(invoices.filter((i) => live(i) && inDays(i.issueDate, days)).map((i) => i.id));
-  return invoicedCents(invoices, days) - sum(lines.filter((l) => counted.has(l.invoiceId) && l.amountCents < 0).map((l) => l.amountCents));
+  return invoicedCents(invoices, days) - sum(lines.filter((l) => counted.has(l.invoiceId) && l.amountCents < 0 && (l.category ?? 'advance') === 'advance').map((l) => l.amountCents));
 }
 
 // ---- Collected (cash basis) -----------------------------------------------------------------------------------------------------
@@ -206,3 +214,165 @@ export function memberBalance(invoices: InvoiceRow[], memberId: string, today: s
 
 /** Amenity charges not collected and not on an invoice, as amenityOwed and the report's amenities.owedCents. */
 export const amenitiesOwedCents = (orders: AmenityOrderRow[]) => sum(orders.filter((o) => o.chargeCents > 0 && o.collectedAt === null && o.invoiceId === null).map((o) => o.chargeCents));
+
+// ---- Tax collected and income by what was sold ----------------------------------------------------------------------------------
+
+const byPaidOrder = (a: PaymentRow, b: PaymentRow) => a.paidAt.localeCompare(b.paidAt) || (a.createdAt ?? '').localeCompare(b.createdAt ?? '') || (a.id ?? '').localeCompare(b.id ?? '');
+
+/**
+ * The tax inside each payment. A payment of part of an invoice carries the same share of its tax; the shares are worked out on the
+ * running total of what has been paid, so once an invoice is paid in full its payments carry exactly its tax, whatever the rounding.
+ * A reversal takes its share back. Keyed by payment id.
+ */
+export function paymentTaxCents(invoices: InvoiceRow[], payments: (PaymentRow & { id: string })[]) {
+  const byId = new Map(invoices.map((i) => [i.id, i]));
+  const out = new Map<string, number>();
+  const groups = new Map<string, (PaymentRow & { id: string })[]>();
+  for (const p of payments) groups.set(p.invoiceId, [...(groups.get(p.invoiceId) ?? []), p]);
+  for (const [invoiceId, list] of groups) {
+    const inv = byId.get(invoiceId);
+    let paid = 0;
+    const taxOf = (x: number) => (inv && inv.totalCents > 0 ? Math.round((Math.min(x, inv.totalCents) * inv.taxCents) / inv.totalCents) : 0);
+    for (const p of [...list].sort(byPaidOrder)) {
+      const before = taxOf(paid);
+      paid += p.amountCents;
+      out.set(p.id, taxOf(Math.max(0, paid)) - before);
+    }
+  }
+  return out;
+}
+
+/** Income, as finance groups it: what was sold, or the kind of money that came in without an invoice. */
+export type IncomeCategory = 'plan' | 'rent' | 'booking' | 'manual' | 'amenity' | 'advance' | 'kept_deposit';
+/** The five kinds the finance screens draw. Plans and rent are memberships; bookings and other charges are one group. */
+export type IncomeKind = 'subscription' | 'manual' | 'kept_deposit' | 'advance' | 'amenities';
+export const INCOME_KIND: Record<IncomeCategory, IncomeKind> = {
+  plan: 'subscription',
+  rent: 'subscription',
+  booking: 'manual',
+  manual: 'manual',
+  amenity: 'amenities',
+  advance: 'advance',
+  kept_deposit: 'kept_deposit',
+};
+
+/** One piece of income: when it came in, before tax, what it was for, and how it was paid. */
+export interface IncomeEntry {
+  at: string;
+  amountCents: number;
+  category: IncomeCategory;
+  method: string;
+  resourceId: string | null;
+  planId: string | null;
+}
+
+/** Splits an amount over weights in proportion, rounding so the parts add up to the amount exactly (the last part takes the rest). */
+export function splitByWeight(amount: number, weights: number[]): number[] {
+  const total = sum(weights);
+  if (!weights.length) return [];
+  if (total <= 0) return weights.map((_, i) => (i === weights.length - 1 ? amount : 0));
+  let given = 0;
+  return weights.map((w, i) => {
+    if (i === weights.length - 1) return amount - given;
+    const part = Math.round((amount * w) / total);
+    given += part;
+    return part;
+  });
+}
+
+export interface Books {
+  invoices: InvoiceRow[];
+  lines: (InvoiceLineRow & { category: string })[];
+  payments: (PaymentRow & { id: string })[];
+  ledger: (LedgerRow & { method: string | null })[];
+  /** Amenity charges collected at the desk before desk collections became receipts: income with no invoice. */
+  amenityOrders: AmenityOrderRow[];
+}
+
+/**
+ * Every piece of income in a window, before tax: each invoice payment shared over the invoice's charges (by line), advances when
+ * received, deposits when kept, and amenity charges collected at the desk without an invoice. Adds up to money collected less tax.
+ */
+export function incomeEntries(b: Books, w: InstantWindow): IncomeEntry[] {
+  const tax = paymentTaxCents(b.invoices, b.payments);
+  const charges = new Map<string, InvoiceLineRow[]>();
+  for (const l of b.lines) if (l.amountCents > 0) charges.set(l.invoiceId, [...(charges.get(l.invoiceId) ?? []), l]);
+  const out: IncomeEntry[] = [];
+  for (const p of b.payments) {
+    if (!inWindow(p.paidAt, w)) continue;
+    const net = p.amountCents - (tax.get(p.id) ?? 0);
+    const lines = charges.get(p.invoiceId) ?? [];
+    if (!lines.length) {
+      out.push({ at: p.paidAt, amountCents: net, category: 'manual', method: p.method, resourceId: null, planId: null });
+      continue;
+    }
+    splitByWeight(net, lines.map((l) => l.amountCents)).forEach((part, i) => {
+      const l = lines[i]!;
+      const category = (['plan', 'rent', 'booking', 'amenity'] as const).find((c) => c === l.category) ?? 'manual';
+      out.push({ at: p.paidAt, amountCents: part, category, method: p.method, resourceId: l.resourceId ?? null, planId: l.planId ?? null });
+    });
+  }
+  for (const e of b.ledger) {
+    if (!inWindow(e.occurredAt, w)) continue;
+    if (e.kind === 'advance') out.push({ at: e.occurredAt, amountCents: e.amountCents, category: 'advance', method: e.method ?? 'other', resourceId: null, planId: null });
+    if (e.kind === 'kept') out.push({ at: e.occurredAt, amountCents: e.amountCents, category: 'kept_deposit', method: 'kept_deposit', resourceId: null, planId: null });
+  }
+  for (const o of b.amenityOrders) {
+    if (o.chargeCents > 0 && o.collectedAt && !o.invoiceId && inWindow(o.collectedAt, w)) out.push({ at: o.collectedAt, amountCents: o.chargeCents, category: 'amenity', method: 'other', resourceId: null, planId: null });
+  }
+  return out;
+}
+
+/** The tax inside the payments made in a window. Collected less this is income. */
+export function taxCollectedCents(b: Books, w: InstantWindow) {
+  const tax = paymentTaxCents(b.invoices, b.payments);
+  return sum(b.payments.filter((p) => inWindow(p.paidAt, w)).map((p) => tax.get(p.id) ?? 0));
+}
+
+/**
+ * All money in during a window, by how it came: invoice payments by their method, advances by theirs, deposits kept as
+ * "kept_deposit" (no money moved: it was received earlier) and old-style desk collections as "other". Adds up to money collected.
+ */
+export function moneyInByMethod(b: Books, w: InstantWindow) {
+  const by = new Map<string, number>();
+  const add = (method: string, cents: number) => by.set(method, (by.get(method) ?? 0) + cents);
+  for (const p of b.payments) if (inWindow(p.paidAt, w)) add(p.method, p.amountCents);
+  for (const e of b.ledger) {
+    if (!inWindow(e.occurredAt, w)) continue;
+    if (e.kind === 'advance') add(e.method ?? 'other', e.amountCents);
+    if (e.kind === 'kept') add('kept_deposit', e.amountCents);
+  }
+  for (const o of b.amenityOrders) if (o.chargeCents > 0 && o.collectedAt && !o.invoiceId && inWindow(o.collectedAt, w)) add('other', o.chargeCents);
+  return [...by.entries()].filter(([, cents]) => cents !== 0).map(([method, amountCents]) => ({ method, amountCents })).sort((x, y) => y.amountCents - x.amountCents || x.method.localeCompare(y.method));
+}
+
+/** Money in (cash basis), the same total as collectedByKind, from the books. */
+export const collectedCents = (b: Books, w: InstantWindow) => sum(moneyInByMethod(b, w).map((m) => m.amountCents));
+
+/** The members who owe the most at the end of a day, with the overdue part and the oldest due date. */
+export function topDebtors(invoices: InvoiceRow[], payments: PaymentRow[], day: string, tz: string, limit = 10) {
+  const by = new Map<string, { memberId: string; owedCents: number; overdueCents: number; oldestDue: string; invoices: number }>();
+  for (const i of invoices.filter((x) => live(x) && x.issueDate <= day)) {
+    const owed = i.totalCents - sum(payments.filter((p) => p.invoiceId === i.id && localDate(p.paidAt, tz) <= day).map((p) => p.amountCents));
+    if (owed <= 0) continue;
+    const row = by.get(i.memberId) ?? { memberId: i.memberId, owedCents: 0, overdueCents: 0, oldestDue: i.dueDate, invoices: 0 };
+    row.owedCents += owed;
+    if (i.dueDate < day) row.overdueCents += owed;
+    if (i.dueDate < row.oldestDue) row.oldestDue = i.dueDate;
+    row.invoices++;
+    by.set(i.memberId, row);
+  }
+  return [...by.values()].sort((a, b) => b.owedCents - a.owedCents).slice(0, limit);
+}
+
+/** Invoices issued in a range by status, with what they came to and what is still owed. "overdue" is the open ones past due on `today`. */
+export function invoicesByStatus(invoices: InvoiceRow[], days: DayRange, today: string) {
+  const issued = invoices.filter((i) => inDays(i.issueDate, days));
+  const row = (list: InvoiceRow[]) => ({ count: list.length, totalCents: sum(list.map((i) => i.totalCents)), owedCents: sum(list.filter(live).map((i) => i.totalCents - i.paidCents)) });
+  return {
+    open: row(issued.filter((i) => i.status === 'open')),
+    paid: row(issued.filter((i) => i.status === 'paid')),
+    void: { ...row(issued.filter((i) => i.status === 'void')), owedCents: 0 },
+    overdue: row(issued.filter((i) => i.status === 'open' && i.dueDate < today)),
+  };
+}

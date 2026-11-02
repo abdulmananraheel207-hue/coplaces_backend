@@ -57,7 +57,8 @@ describe('deposit ledger', () => {
     expect(r.incomeByKind.find((i: { kind: string }) => i.kind === 'kept_deposit').amountCents).toBe(40_000);
     expect(r.profitLoss.income.find((i: { kind: string }) => i.kind === 'kept_deposit').totalCents).toBe(40_000);
     expect(r.monthly.at(-1).collectedCents).toBe(40_000);
-    expect(r.paymentsByMethod).toEqual([]);
+    // No new money moved when it was kept (it was received earlier), so it shows as kept, not under a payment method.
+    expect(r.paymentsByMethod).toEqual([{ method: 'kept_deposit', amountCents: 40_000 }]);
   });
 
   it('counts a forfeited deposit as income in full', async () => {

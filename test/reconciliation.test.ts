@@ -10,13 +10,7 @@ import { buildReconciliationScenario, bugsIn, reconcile, type Check } from './he
 const knownBug = process.env.SHOW_BUGS ? it : it.fails;
 
 /** The bugs the scenario's checks are tagged with. Adding a tagged check without listing its bug here fails the first test. */
-const BUGS: Record<string, string> = {
-  L3: 'payments by method reconcile with money collected',
-  R1: 'invoiced includes the part of a bill an advance paid',
-  R2: 'tax is reported and kept out of profit and loss income',
-  R4a: 'aging is as of the report end date',
-  R4b: 'deposits held are as of the report end date',
-};
+const BUGS: Record<string, string> = {};
 
 let checks: Check[] = [];
 
@@ -29,7 +23,7 @@ const failures = (list: Check[]) => list.filter((c) => JSON.stringify(c.actual) 
 
 describe('reconciliation: one scenario, every screen', () => {
   it('agrees on every definition that is right today', () => {
-    expect(checks.length).toBeGreaterThan(60);
+    expect(checks.length).toBeGreaterThan(70);
     expect(bugsIn(checks)).toEqual(Object.keys(BUGS).sort());
     expect(failures(checks.filter((c) => !c.bug))).toEqual([]);
   });

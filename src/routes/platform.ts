@@ -19,7 +19,7 @@ import { orgUsage, superAdminOnly } from '../lib/auth.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { idParam } from '../lib/http.js';
 import { tempPassword } from '../lib/passwords.js';
-import { addDays, addMonthsToDate, daysBetween, isValidDate, isValidTimezone, monthRange, todayIn } from '../lib/time.js';
+import { addDays, addMonths, addMonthsToDate, daysBetween, isValidDate, isValidTimezone, localDate, monthRange, todayIn } from '../lib/time.js';
 import { parse } from '../lib/validate.js';
 import { checkPaidAt, positiveMoney } from '../lib/money.js';
 import { audit } from '../services/audit.js';
@@ -359,6 +359,32 @@ export function platformRouter(db: Db) {
       .limit(500)
       .all();
     res.json(rows.map(({ p, ...rest }) => ({ ...p, ...rest })));
+  });
+
+  /**
+   * Platform income month by month: what tenants paid in each month, and the recurring revenue each month earned, with every
+   * subscription payment spread evenly over the months it paid for. Up to 36 months back.
+   */
+  r.get('/mrr-trend', async (req, res) => {
+    const months = Math.min(36, Math.max(1, Number(req.query.months) || 12));
+    const t = today();
+    const list: string[] = [];
+    for (let i = months - 1; i >= 0; i--) list.push(addMonths(t.slice(0, 7), -i));
+    const rows = await db.select().from(platformPayments).all();
+    const out = list.map((month) => ({ month, collectedCents: 0, earnedCents: 0 }));
+    const at = new Map(list.map((m, i) => [m, i]));
+    for (const p of rows) {
+      const paidMonth = localDate(p.paidAt, config.platformTimezone).slice(0, 7);
+      if (at.has(paidMonth)) out[at.get(paidMonth)!]!.collectedCents += p.amountCents;
+      // The months the payment covers, from the month its period starts up to the month before it ends.
+      const covered: string[] = [];
+      for (let m = p.periodStart.slice(0, 7); m < p.periodEnd.slice(0, 7) || covered.length === 0; m = addMonths(m, 1)) covered.push(m);
+      covered.forEach((m, i) => {
+        const share = i === covered.length - 1 ? p.amountCents - Math.round(p.amountCents / covered.length) * (covered.length - 1) : Math.round(p.amountCents / covered.length);
+        if (at.has(m)) out[at.get(m)!]!.earnedCents += share;
+      });
+    }
+    res.json({ currency: 'PKR', months: out });
   });
 
   r.get('/overview', async (_req, res) => {

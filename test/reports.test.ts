@@ -87,9 +87,12 @@ describe('dashboard and finance reports', () => {
 
     // Profit and loss: every row adds up to the totals, and the periods line up.
     expect(f.profitLoss.months).toHaveLength(6);
-    expect(f.profitLoss.income.reduce((n: number, r: { totalCents: number }) => n + r.totalCents, 0)).toBe(f.totals.collectedCents);
+    // Income is money in less the tax inside the payments; the tax has its own row.
+    expect(f.profitLoss.income.reduce((n: number, r: { totalCents: number }) => n + r.totalCents, 0)).toBe(f.totals.collectedCents - f.totals.taxCollectedCents);
+    expect(f.profitLoss.tax.totalCents).toBe(f.totals.taxCollectedCents);
+    expect(f.totals.incomeCents).toBe(f.totals.collectedCents - f.totals.taxCollectedCents);
     expect(f.profitLoss.costs.reduce((n: number, r: { totalCents: number }) => n + r.totalCents, 0)).toBe(f.totals.expensesCents);
-    expect(f.incomeByKind.reduce((n: number, r: { amountCents: number }) => n + r.amountCents, 0)).toBe(f.totals.collectedCents);
+    expect(f.incomeByKind.reduce((n: number, r: { amountCents: number }) => n + r.amountCents, 0)).toBe(f.totals.incomeCents);
     expect(f.previous.to < f.from).toBe(true);
 
     const dash = (await manager.get(`/api/reports/dashboard?locationId=${loc.id}`).expect(200)).body;

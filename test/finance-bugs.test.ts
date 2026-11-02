@@ -251,7 +251,7 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect(res.status === 409 || !!(await rows.invoice(ctx, inv.id))).toBe(true);
   });
 
-  knownBug('R1: when every bill is paid exactly, money collected equals money invoiced (advance included)', async () => {
+  it('R1: when every bill is paid exactly, money collected equals money invoiced (advance included)', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     const p = await planWithShifts(ctx, owner);
@@ -262,7 +262,7 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect(rep.totals.collectedCents).toBe(rep.totals.invoicedCents); // today: 5,300 collected against 3,300 invoiced
   });
 
-  knownBug('R2: tax collected is not counted as income in the profit and loss', async () => {
+  it('R2: tax collected is not counted as income in the profit and loss', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     const inv = await manualInvoice(owner, ctx.basic.member.id, 10_000); // + 10% tax = 11,000
@@ -271,7 +271,7 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect(sum(rep.profitLoss.income.map((r: { totalCents: number }) => r.totalCents))).toBe(10_000);
   });
 
-  knownBug('R3: a long report’s monthly series adds up to its totals (no 60-month cap)', async () => {
+  it('R3: a long report’s monthly series adds up to its totals (no 60-month cap)', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     const inv = await manualInvoice(owner, ctx.basic.member.id, 10_000);
@@ -282,7 +282,7 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect(sum(rep.monthly.map((m: { collectedCents: number }) => m.collectedCents))).toBe(rep.totals.collectedCents);
   });
 
-  knownBug('R4a: receivables aging is as of the report’s end date', async () => {
+  it('R4a: receivables aging is as of the report’s end date', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     await manualInvoice(owner, ctx.basic.member.id, 10_000); // issued today
@@ -291,7 +291,7 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect(sum(Object.values(rep.receivablesAging).map((b) => (b as { amountCents: number }).amountCents))).toBe(0);
   });
 
-  knownBug('R4b: deposits held are as of the report’s end date', async () => {
+  it('R4b: deposits held are as of the report’s end date', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     const c = (await owner.post('/api/contracts').send({ locationId: ctx.loc.id, memberId: ctx.basic.member.id, startDate: today(), depositCents: 100_000 }).expect(201)).body;

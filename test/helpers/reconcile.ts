@@ -116,23 +116,38 @@ export async function reconcile(ctx: Ctx, s: Scenario): Promise<Check[]> {
   const moves = await ctx.db.select().from(depositEntries).where(eq(depositEntries.locationId, L)).all();
   const orders = await ctx.db.select().from(amenityOrders).where(eq(amenityOrders.locationId, L)).all();
   const costs = await ctx.db.select().from(expenses).where(eq(expenses.locationId, L)).all();
-  const kindOf = new Map(invs.map((i) => [i.id, i.kind]));
 
   const paysIn = pays.filter((p) => inRange(localDay(p.paidAt)));
   const movesIn = (kind: string) => moves.filter((m) => m.kind === kind && inRange(localDay(m.occurredAt)));
-  const deskIn = orders.filter((o) => o.chargeCents > 0 && o.collectedAt && inRange(localDay(o.collectedAt)));
-  const byKind = {
-    subscription: sum(paysIn.filter((p) => kindOf.get(p.invoiceId) === 'subscription').map((p) => p.amountCents)),
-    manual: sum(paysIn.filter((p) => kindOf.get(p.invoiceId) === 'manual').map((p) => p.amountCents)),
-    kept_deposit: sum(movesIn('kept').map((m) => m.amountCents)),
-    advance: sum(movesIn('advance').map((m) => m.amountCents)),
-    amenities: sum(deskIn.map((o) => o.chargeCents)),
-  };
-  const collected = sum(Object.values(byKind));
+  const deskIn = orders.filter((o) => o.chargeCents > 0 && o.collectedAt && !o.invoiceId && inRange(localDay(o.collectedAt)));
+  const payIn = sum(paysIn.map((p) => p.amountCents));
+  const kept = sum(movesIn('kept').map((m) => m.amountCents));
+  const advanced = sum(movesIn('advance').map((m) => m.amountCents));
+  const desk = sum(deskIn.map((o) => o.chargeCents));
+  const collected = payIn + kept + advanced + desk;
   const spent = sum(costs.filter((e) => inRange(e.incurredOn)).map((e) => e.amountCents));
   const invoiced = sum(live.filter((i) => inRange(i.issueDate)).map((i) => i.totalCents));
-  const advanceLines = (inv: (typeof invs)[number]) => -sum(items.filter((l) => l.invoiceId === inv.id && l.amountCents < 0).map((l) => l.amountCents));
+  const advanceLines = (inv: (typeof invs)[number]) => -sum(items.filter((l) => l.invoiceId === inv.id && l.amountCents < 0 && l.category === 'advance').map((l) => l.amountCents));
+  /** What members were billed: invoice totals with the part an advance paid added back (the advance is money in when received). */
+  const billed = invoiced + sum(live.filter((i) => inRange(i.issueDate)).map(advanceLines));
   const openBalance = sum(live.filter((i) => i.status === 'open').map((i) => i.totalCents - i.paidCents));
+
+  /** The tax inside each payment, worked out again here: each invoice's tax shared over its payments on the running total paid. */
+  const taxIn = new Map<string, number>();
+  for (const i of invs) {
+    let paid = 0;
+    const taxOf = (x: number) => (i.totalCents > 0 ? Math.round((Math.min(x, i.totalCents) * i.taxCents) / i.totalCents) : 0);
+    const mine = pays.filter((p) => p.invoiceId === i.id).sort((a, b) => a.paidAt.localeCompare(b.paidAt) || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+    for (const p of mine) {
+      const before = taxOf(paid);
+      paid += p.amountCents;
+      taxIn.set(p.id, taxOf(Math.max(0, paid)) - before);
+    }
+  }
+  const tax = sum(paysIn.map((p) => taxIn.get(p.id) ?? 0));
+  for (const i of live.filter((x) => x.status === 'paid' && x.paidCents === x.totalCents)) {
+    check(`${i.number}: its payments carry exactly its tax`, sum(pays.filter((p) => p.invoiceId === i.id).map((p) => taxIn.get(p.id) ?? 0)), i.taxCents);
+  }
 
   /** What was owed at the end of a day: invoices issued by then, less what was paid by then. */
   const owedAsOf = (day: string) =>
@@ -149,13 +164,21 @@ export async function reconcile(ctx: Ctx, s: Scenario): Promise<Check[]> {
   // ---- the finance report
   const rep = await financeReport(owner, L, from, to);
   check('report: collected', rep.totals.collectedCents, collected);
-  check('report: invoiced (as stored)', rep.totals.invoicedCents, invoiced);
+  check('report: invoiced is what was billed, the part an advance paid included', rep.totals.invoicedCents, billed);
+  check('report: tax collected', rep.totals.taxCollectedCents, tax);
+  check('report: income before tax', rep.totals.incomeCents, collected - tax);
   check('report: expenses', rep.totals.expensesCents, spent);
-  check('report: net', rep.totals.netCents, collected - spent);
-  for (const k of Object.keys(byKind) as (keyof typeof byKind)[]) check(`report: income of kind ${k}`, rep.incomeByKind.find((x: { kind: string }) => x.kind === k)?.amountCents, byKind[k]);
+  check('report: net (cash)', rep.totals.netCents, collected - spent);
+  check('report: profit (income before tax less expenses)', rep.totals.profitCents, collected - tax - spent);
+  const kind = (k: string) => rep.incomeByKind.find((x: { kind: string }) => x.kind === k)?.amountCents;
+  check('report: income of kind advance', kind('advance'), advanced);
+  check('report: income of kind kept_deposit', kind('kept_deposit'), kept);
+  check('report: income from invoices and the desk, before tax', kind('subscription') + kind('manual') + kind('amenities'), payIn - tax + desk);
+  check('report: income by kind adds up', sum(rep.incomeByKind.map((x: { amountCents: number }) => x.amountCents)), collected - tax);
+  check('report: income by category adds up', sum(rep.incomeByCategory.map((x: { amountCents: number }) => x.amountCents)), collected - tax);
   check('report: monthly money in adds up', sum(rep.monthly.map((m: { collectedCents: number }) => m.collectedCents)), collected);
   check('report: monthly money out adds up', sum(rep.monthly.map((m: { expensesCents: number }) => m.expensesCents)), spent);
-  check('report: monthly invoiced adds up', sum(rep.monthly.map((m: { invoicedCents: number }) => m.invoicedCents)), invoiced);
+  check('report: monthly invoiced adds up', sum(rep.monthly.map((m: { invoicedCents: number }) => m.invoicedCents)), billed);
   for (const m of rep.monthly as { month: string; collectedCents: number; expensesCents: number; invoicedCents: number; netCents: number }[]) {
     const end = addDays(`${addMonths(m.month, 1)}-01`, -1);
     const a = m.month === from.slice(0, 7) ? from : `${m.month}-01`;
@@ -164,12 +187,13 @@ export async function reconcile(ctx: Ctx, s: Scenario): Promise<Check[]> {
     const monthIn =
       sum(pays.filter((p) => inMonth(localDay(p.paidAt))).map((p) => p.amountCents)) +
       sum(moves.filter((x) => (x.kind === 'kept' || x.kind === 'advance') && inMonth(localDay(x.occurredAt))).map((x) => x.amountCents)) +
-      sum(orders.filter((o) => o.chargeCents > 0 && o.collectedAt && inMonth(localDay(o.collectedAt))).map((o) => o.chargeCents));
+      sum(orders.filter((o) => o.chargeCents > 0 && o.collectedAt && !o.invoiceId && inMonth(localDay(o.collectedAt))).map((o) => o.chargeCents));
     check(`report: ${m.month} money in, by local date`, m.collectedCents, monthIn);
     check(`report: ${m.month} money out`, m.expensesCents, sum(costs.filter((e) => inMonth(e.incurredOn)).map((e) => e.amountCents)));
     check(`report: ${m.month} net`, m.netCents, m.collectedCents - m.expensesCents);
   }
-  check('report: profit and loss income', sum(rep.profitLoss.income.map((r: { totalCents: number }) => r.totalCents)), collected);
+  check('report: profit and loss income is income before tax', sum(rep.profitLoss.income.map((r: { totalCents: number }) => r.totalCents)), collected - tax);
+  check('report: profit and loss tax', rep.profitLoss.tax.totalCents, tax);
   check('report: profit and loss costs', sum(rep.profitLoss.costs.map((r: { totalCents: number }) => r.totalCents)), spent);
   check('report: expenses by category', sum(rep.expensesByCategory.map((r: { amountCents: number }) => r.amountCents)), spent);
   check('report: aging adds up to what is owed now (the end date is today)', sum(Object.values(rep.receivablesAging).map((b) => (b as { amountCents: number }).amountCents)), openBalance);
@@ -177,28 +201,21 @@ export async function reconcile(ctx: Ctx, s: Scenario): Promise<Check[]> {
   check('report: deposits received in range', rep.deposits.receivedCents, sum(movesIn('received').map((m) => m.amountCents)));
   check('report: deposits refunded in range', rep.deposits.refundedCents, sum(movesIn('refunded').map((m) => m.amountCents)));
   check('report: amenities still owed', rep.amenities.owedCents, sum(orders.filter((o) => o.chargeCents > 0 && !o.collectedAt && !o.invoiceId).map((o) => o.chargeCents)));
-  check('report: amenities collected', rep.amenities.collectedCents, byKind.amenities);
+  check('report: amenities collected = amenity income', rep.amenities.collectedCents, rep.incomeByCategory.find((x: { category: string }) => x.category === 'amenity')?.amountCents ?? 0);
   // Every way money came in has a method, so the methods add up to what was collected.
-  check('report: payments by method reconcile with money collected', sum(rep.paymentsByMethod.map((m: { amountCents: number }) => m.amountCents)), collected, 'L3');
-  // Invoiced counts what members were billed, including the part paid by an advance, so collection can be compared with billing.
-  check('report: invoiced includes the part an advance paid', rep.totals.invoicedCents, invoiced + sum(live.filter((i) => inRange(i.issueDate)).map(advanceLines)), 'R1');
-  // Tax is owed to the government: the profit and loss counts income without it.
-  check('report: tax collected is reported', typeof rep.totals.taxCollectedCents, 'number', 'R2');
-  check(
-    'report: profit and loss income excludes tax',
-    sum(rep.profitLoss.income.map((r: { totalCents: number }) => r.totalCents)),
-    collected - (typeof rep.totals.taxCollectedCents === 'number' ? rep.totals.taxCollectedCents : -1),
-    'R2',
-  );
+  check('report: payments by method reconcile with money collected', sum(rep.paymentsByMethod.map((m: { amountCents: number }) => m.amountCents)), collected);
+  check('report: advances by method', sum(rep.paymentsByMethod.filter((m: { method: string }) => m.method === 'bank_transfer').map((m: { amountCents: number }) => m.amountCents)), sum(paysIn.filter((p) => p.method === 'bank_transfer').map((p) => p.amountCents)) + sum(movesIn('advance').filter((m) => m.method === 'bank_transfer').map((m) => m.amountCents)));
   // The company's 10,000.00 advance must come off its invoices.
   const companyLive = live.filter((i) => i.memberId === s.companyMemberId);
   check('company: advance taken off its invoices', sum(companyLive.map(advanceLines)), 1_000_000);
+  check('report: nothing left unapplied', rep.unapplied, { advancesCents: 0, creditsCents: 0 });
 
   // ---- a report that ends last month: aging and deposits as of that day
   const prevEnd = addDays(`${to.slice(0, 7)}-01`, -1);
   const past = await financeReport(owner, L, from, prevEnd);
-  check('past report: aging as of its end date', sum(Object.values(past.receivablesAging).map((b) => (b as { amountCents: number }).amountCents)), owedAsOf(prevEnd), 'R4a');
-  check('past report: deposits held as of its end date', past.deposits.heldCents, heldAsOf(prevEnd), 'R4b');
+  check('past report: aging as of its end date', sum(Object.values(past.receivablesAging).map((b) => (b as { amountCents: number }).amountCents)), owedAsOf(prevEnd));
+  check('past report: deposits held as of its end date', past.deposits.heldCents, heldAsOf(prevEnd));
+  check('past report: says what date it is as of', past.asOf, prevEnd);
 
   // ---- the Today page against a report for this month
   const monthStart = `${to.slice(0, 7)}-01`;
@@ -217,7 +234,7 @@ export async function reconcile(ctx: Ctx, s: Scenario): Promise<Check[]> {
   const overdueList = (await owner.get(`/api/invoices?locationId=${L}&status=overdue`).expect(200)).body as { balanceCents: number }[];
   check('invoice list: overdue = Today overdue', sum(overdueList.map((i) => i.balanceCents)), dash.overdueCents);
   const payList = (await owner.get(`/api/payments?locationId=${L}&from=${from}&to=${to}`).expect(200)).body as { amountCents: number }[];
-  check('payment list = invoice payments in the report', sum(payList.map((p) => p.amountCents)), byKind.subscription + byKind.manual);
+  check('payment list = invoice payments in the report', sum(payList.map((p) => p.amountCents)), payIn);
   const costList = (await owner.get(`/api/expenses?locationId=${L}&from=${from}&to=${to}`).expect(200)).body as { amountCents: number }[];
   check('expense list = report expenses', sum(costList.map((e) => e.amountCents)), spent);
 

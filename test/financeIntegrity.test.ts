@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { amenityOrders, bookings, depositEntries, expenses, invoiceItems, invoices, locations, members, payments, resources } from '../src/db/schema.js';
 import { addDays, addMonths, todayIn } from '../src/lib/time.js';
 import { inDays, login, setup, TZ } from './helpers.js';
+import { taxInside } from './helpers/finance.js';
 
 type Ctx = Awaited<ReturnType<typeof setup>>;
 type Agent = Awaited<ReturnType<typeof login>>;
@@ -45,20 +46,27 @@ async function checkBooks(ctx: Ctx, owner: Agent, step: string) {
   // ---- the finance report
   const rep = (await owner.get(`/api/reports/finance?locationId=${L}&from=${today.slice(0, 7)}-01&to=${today}`).expect(200)).body;
   const moneyIn = sum(pays.map((p) => p.amountCents)) + kind('kept') + kind('advance') + deskIncome;
+  // Invoiced is what was billed: the part an advance paid is added back, as the advance itself is money in when it arrives.
+  const allLines = (await Promise.all(live.map((i) => ctx.db.select().from(invoiceItems).where(eq(invoiceItems.invoiceId, i.id)).all()))).flat();
+  const billed = sum(live.map((i) => i.totalCents)) - sum(allLines.filter((l) => l.category === 'advance').map((l) => l.amountCents));
+  // Income is money in less the tax inside the payments, worked out here on its own.
+  const tax = taxInside(invs, pays);
   expect(rep.totals.collectedCents, `${step}: money in`).toBe(moneyIn);
-  expect(rep.totals.invoicedCents, `${step}: invoiced`).toBe(sum(live.map((i) => i.totalCents)));
+  expect(rep.totals.taxCollectedCents, `${step}: tax collected`).toBe(tax);
+  expect(rep.totals.invoicedCents, `${step}: invoiced`).toBe(billed);
   expect(rep.totals.expensesCents, `${step}: money out`).toBe(spend);
   expect(rep.totals.netCents, `${step}: profit`).toBe(moneyIn - spend);
-  expect(sum(rep.incomeByKind.map((k: { amountCents: number }) => k.amountCents)), `${step}: income by kind`).toBe(moneyIn);
+  expect(sum(rep.incomeByKind.map((k: { amountCents: number }) => k.amountCents)), `${step}: income by kind`).toBe(moneyIn - tax);
   expect(sum(rep.monthly.map((m: { collectedCents: number }) => m.collectedCents)), `${step}: monthly money in`).toBe(moneyIn);
-  expect(sum(rep.profitLoss.income.map((k: { totalCents: number }) => k.totalCents)), `${step}: profit and loss income`).toBe(moneyIn);
+  expect(sum(rep.profitLoss.income.map((k: { totalCents: number }) => k.totalCents)), `${step}: profit and loss income`).toBe(moneyIn - tax);
+  expect(rep.profitLoss.tax.totalCents, `${step}: profit and loss tax`).toBe(tax);
   expect(sum(rep.profitLoss.costs.map((k: { totalCents: number }) => k.totalCents)), `${step}: profit and loss costs`).toBe(spend);
-  expect(sum(rep.paymentsByMethod.map((m: { amountCents: number }) => m.amountCents)), `${step}: payments by method`).toBe(sum(pays.map((p) => p.amountCents)));
+  expect(sum(rep.paymentsByMethod.map((m: { amountCents: number }) => m.amountCents)), `${step}: money in by method`).toBe(moneyIn);
   expect(rep.deposits.heldCents, `${step}: deposits held`).toBe(kind('received') - kind('refunded') - kind('kept'));
   expect(rep.deposits.keptCents, `${step}: deposits kept`).toBe(kind('kept'));
   expect(rep.deposits.advanceCents, `${step}: advances`).toBe(kind('advance'));
   expect(rep.amenities.owedCents, `${step}: amenities to collect`).toBe(owedAtDesk);
-  expect(rep.amenities.collectedCents, `${step}: amenities collected`).toBe(deskIncome);
+  expect(rep.amenities.collectedCents, `${step}: amenities collected`).toBe(rep.incomeByCategory.find((c: { category: string }) => c.category === 'amenity')?.amountCents ?? 0);
 
   const openBalance = sum(live.filter((i) => i.status === 'open').map((i) => i.totalCents - i.paidCents));
   expect(sum(Object.values(rep.receivablesAging).map((b) => (b as { amountCents: number }).amountCents)), `${step}: still owed`).toBe(openBalance);
@@ -67,7 +75,8 @@ async function checkBooks(ctx: Ctx, owner: Agent, step: string) {
   const dash = (await owner.get(`/api/reports/dashboard?locationId=${L}`).expect(200)).body.finance;
   expect(dash.outstandingCents, `${step}: Today outstanding`).toBe(openBalance);
   expect(dash.collectedThisMonthCents, `${step}: Today money in`).toBe(moneyIn);
-  expect(dash.invoicedThisMonthCents, `${step}: Today invoiced`).toBe(sum(live.map((i) => i.totalCents)));
+  expect(dash.invoicedThisMonthCents, `${step}: Today invoiced`).toBe(billed);
+  expect(dash.taxCollectedThisMonthCents, `${step}: Today tax`).toBe(tax);
   expect(dash.expensesThisMonthCents, `${step}: Today money out`).toBe(spend);
 
   // ---- the invoice list and each member's balance
@@ -299,8 +308,10 @@ describe('finance over time', () => {
     expect(wide.totals).toMatchObject({ collectedCents: 265_000, invoicedCents: 110_000 + 275_000 + 88_000, expensesCents: 50_000, netCents: 215_000 });
     expect(wide.months ?? wide.monthly.map((r: { month: string }) => r.month)).toEqual([twoAgo, lastMonth, thisMonth]);
     expect(wide.profitLoss.months).toEqual([twoAgo, lastMonth, thisMonth]);
+    // The profit and loss counts income before tax (10% here): the tax inside a part payment is its share of the invoice's tax.
     const sub = wide.profitLoss.income.find((k: { kind: string }) => k.kind === 'manual');
-    expect(sub.byMonth).toEqual([110_000, 155_000, 0]);
+    expect(sub.byMonth).toEqual([100_000, Math.round(100_000 - (100_000 * 20_000) / 220_000) + 50_000, 0]);
+    expect(wide.profitLoss.tax.byMonth).toEqual([10_000, Math.round((100_000 * 20_000) / 220_000) + 5_000, 0]);
 
     // This month only: the money in is this month's, and "the period before" is the same number of days just before it.
     const month = (await owner.get(`/api/reports/finance?locationId=${L}&from=${thisMonth}-01&to=${today}`).expect(200)).body;
