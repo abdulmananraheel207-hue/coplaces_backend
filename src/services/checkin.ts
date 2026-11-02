@@ -3,7 +3,7 @@ import type { Db } from '../db/client.js';
 import { attendance, bookings, memberShifts, resourceAssignments, resources, users, members } from '../db/schema.js';
 import { loadLocation } from '../lib/access.js';
 import { badRequest, conflict } from '../lib/errors.js';
-import { dayRange, localDate, localTime, toMinutes, todayIn, zonedToUtc } from '../lib/time.js';
+import { addDays, businessDateOf, crossesMidnight, dayRange, isOpenAt, localTime, minutesBetween, todayIn, zonedToUtc } from '../lib/time.js';
 import { isHourly } from '../catalogue.js';
 import { closedReason, weekdayOf } from './bookings.js';
 
@@ -19,14 +19,21 @@ const EARLY = 30;
  */
 export async function closeStaleVisits(db: Db, locationId: string, now = new Date()) {
   const loc = await loadLocation(db, locationId);
-  const todayStart = dayRange(todayIn(loc.timezone, now), loc.timezone).start;
-  const stale = await db
+  const open = await db
     .select()
     .from(attendance)
-    .where(and(eq(attendance.locationId, locationId), isNull(attendance.checkOutAt), lt(attendance.checkInAt, todayStart)))
+    .where(and(eq(attendance.locationId, locationId), isNull(attendance.checkOutAt)))
     .all();
+  const nowIso = now.toISOString();
+  // The business day a visit began in ends at the closing time, which for a business open past midnight is the next morning.
+  const closingOf = (checkInAt: string) => {
+    const date = businessDateOf(checkInAt, loc.timezone, loc.openTime, loc.closeTime);
+    return zonedToUtc(crossesMidnight(loc.openTime, loc.closeTime) ? addDays(date, 1) : date, loc.closeTime, loc.timezone).toISOString();
+  };
+  const startOfBusinessDay = zonedToUtc(businessDateOf(now, loc.timezone, loc.openTime, loc.closeTime), '00:00', loc.timezone).toISOString();
+  const stale = open.filter((a) => a.checkInAt < startOfBusinessDay || (crossesMidnight(loc.openTime, loc.closeTime) && closingOf(a.checkInAt) <= nowIso));
   for (const a of stale) {
-    const closing = zonedToUtc(localDate(a.checkInAt, loc.timezone), loc.closeTime, loc.timezone).toISOString();
+    const closing = closingOf(a.checkInAt);
     const left = closing > a.checkInAt ? closing : a.checkInAt;
     await db.update(attendance).set({ checkOutAt: left }).where(eq(attendance.id, a.id)).run();
     await finishBookingOnCheckOut(db, a, new Date(a.checkInAt));
@@ -56,8 +63,9 @@ async function whyNotNow(t: Db, memberId: string, mine: { b: { startsAt: string;
 export async function checkInMember(db: Db, member: { id: string; locationId: string }, resourceId: string | null, now = new Date()) {
   const loc = await loadLocation(db, member.locationId);
   const tz = loc.timezone;
-  const todayDate = todayIn(tz, now);
-  const day = dayRange(todayDate, tz);
+  // Before the closing time of a business that stays open past midnight, it is still the day before.
+  const todayDate = businessDateOf(now, tz, loc.openTime, loc.closeTime);
+  const day = { start: zonedToUtc(todayDate, '00:00', tz).toISOString(), end: zonedToUtc(addDays(todayDate, crossesMidnight(loc.openTime, loc.closeTime) ? 2 : 1), '00:00', tz).toISOString() };
   await closeStaleVisits(db, member.locationId, now);
 
   return db.transaction(async (tx) => {
@@ -193,8 +201,7 @@ export async function checkInMember(db: Db, member: { id: string; locationId: st
     if (!rented.length) {
       const openTime = target?.openTime ?? loc.openTime;
       const closeTime = target?.closeTime ?? loc.closeTime;
-      const nowTime = localTime(now, tz);
-      if (toMinutes(nowTime) < toMinutes(openTime) || toMinutes(nowTime) >= toMinutes(closeTime)) {
+      if (!isOpenAt(localTime(now, tz), openTime, closeTime)) {
         throw badRequest(`${target ? target.name : loc.name} is open ${openTime} to ${closeTime}, so nobody can check in now`);
       }
     }
@@ -232,4 +239,47 @@ export async function finishBookingOnCheckOut(db: Db, row: { memberId: string; r
       ),
     )
     .run();
+}
+
+/**
+ * Members still in the building after the time they were meant to leave: they are checked in, their booking or shift has ended,
+ * and nothing they booked is running now or about to start. The front desk sees these, and so does the member.
+ */
+export async function overstayers(db: Db, locationId: string, memberId?: string, now = new Date()) {
+  const loc = await loadLocation(db, locationId);
+  const open = await db
+    .select({ a: attendance, name: users.name })
+    .from(attendance)
+    .innerJoin(members, eq(members.id, attendance.memberId))
+    .innerJoin(users, eq(users.id, members.userId))
+    .where(and(eq(attendance.locationId, locationId), isNull(attendance.checkOutAt), memberId ? eq(attendance.memberId, memberId) : undefined))
+    .all();
+  if (!open.length) return [];
+  const nowMs = now.getTime();
+  const nowIso = now.toISOString();
+  const rows = await db
+    .select({ b: bookings, kind: resources.kind, name: resources.name })
+    .from(bookings)
+    .innerJoin(resources, eq(resources.id, bookings.resourceId))
+    .where(and(inArray(bookings.memberId, open.map((o) => o.a.memberId)), inArray(bookings.status, [...LIVE]), lt(bookings.startsAt, new Date(nowMs + 24 * 3_600_000).toISOString()), gte(bookings.endsAt, new Date(nowMs - 24 * 3_600_000).toISOString())))
+    .all();
+  const rented = new Set(
+    (await db
+      .select({ memberId: resourceAssignments.memberId })
+      .from(resourceAssignments)
+      .where(and(inArray(resourceAssignments.memberId, open.map((o) => o.a.memberId)), lte(resourceAssignments.startDate, businessDateOf(now, loc.timezone, loc.openTime, loc.closeTime)), or(isNull(resourceAssignments.endDate), gte(resourceAssignments.endDate, businessDateOf(now, loc.timezone, loc.openTime, loc.closeTime)))))
+      .all()).map((r) => r.memberId),
+  );
+  const out = [];
+  for (const { a, name } of open) {
+    if (rented.has(a.memberId)) continue; // a space of their own can be used at any hour
+    const mine = rows.filter((x) => x.b.memberId === a.memberId && PLACES.includes(x.kind));
+    if (!mine.length) continue;
+    // Something is running now, or starts soon enough that they are early for it.
+    if (mine.some((x) => nowMs >= Date.parse(x.b.startsAt) - EARLY * 60_000 && nowMs < Date.parse(x.b.endsAt))) continue;
+    const ended = mine.filter((x) => x.b.endsAt <= nowIso && x.b.endsAt >= a.checkInAt).sort((p, q) => q.b.endsAt.localeCompare(p.b.endsAt))[0];
+    if (!ended) continue;
+    out.push({ attendanceId: a.id, memberId: a.memberId, memberName: name, resourceName: ended.name, endedAt: ended.b.endsAt, minutesOver: minutesBetween(ended.b.endsAt, nowIso), checkedInAt: a.checkInAt });
+  }
+  return out.sort((p, q) => q.minutesOver - p.minutesOver);
 }

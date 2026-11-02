@@ -20,7 +20,7 @@ describe('floor plan', () => {
         ],
         create: [
           { kind: 'corporate_room', style: 'boardroom', name: 'Executive Suite', floor: '2', capacity: 14, hourlyRateCents: 900_000, plan: plan(0, 0, { w: 9, d: 5 }) },
-          { kind: 'hot_desk', style: 'standing', name: 'Standing Desk 1', floor: '1', dailyRateCents: 150_000, plan: plan(12, 3) },
+          { kind: 'hot_desk', style: 'standing', name: 'Standing Desk 1', floor: '1', plan: plan(12, 3) },
         ],
         retire: [desk2.id],
         objects: { upsert: [{ type: 'coffee_machine', floor: '1', label: 'Lobby coffee', x: 2, z: 8, rot: 0 }, { type: 'kitchen', floor: '1', x: 6, z: 8, rot: 2 }], remove: [] },

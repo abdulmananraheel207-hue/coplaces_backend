@@ -36,8 +36,6 @@ const props = z
     name: z.string().trim().min(1).max(100),
     style: z.string().trim().max(40),
     capacity: z.number().int().min(1).max(500),
-    hourlyRateCents: z.number().int().min(0),
-    dailyRateCents: z.number().int().min(0),
     amenities: z.string().trim().max(300),
   })
   .partial();
@@ -57,8 +55,6 @@ const body = z.object({
         name: z.string().trim().min(1).max(100),
         floor,
         capacity: z.number().int().min(1).max(500).default(1),
-        hourlyRateCents: z.number().int().min(0).default(0),
-        dailyRateCents: z.number().int().min(0).default(0),
         amenities: z.string().trim().max(300).default(''),
         plan,
       }),
@@ -87,8 +83,6 @@ const templateThing = z.discriminatedUnion('type', [
     style: z.string().trim().max(40),
     name: z.string().trim().max(100),
     capacity: z.number().int().min(1).max(500),
-    hourlyRateCents: z.number().int().min(0),
-    dailyRateCents: z.number().int().min(0),
     amenities: z.string().trim().max(300),
     x: coord,
     z: coord,

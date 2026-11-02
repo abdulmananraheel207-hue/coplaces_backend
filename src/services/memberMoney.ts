@@ -80,14 +80,6 @@ export async function advanceCredit(t: Db, memberId: string, grossCents: number)
   return { description: 'Advance paid', quantity: 1, unitPriceCents: -credit };
 }
 
-/** When an unpaid invoice is voided, the advance it used goes back to the member to be used on the replacement. */
-export async function releaseAdvance(db: Db, invoiceId: string, memberId: string) {
-  const used = (await db.select({ n: sql<number>`coalesce(sum(-${invoiceItems.amountCents}), 0)` }).from(invoiceItems).where(and(eq(invoiceItems.invoiceId, invoiceId), lt(invoiceItems.amountCents, 0))).get())?.n ?? 0;
-  if (used <= 0) return;
-  const m = await db.select().from(members).where(eq(members.id, memberId)).get();
-  if (m) await db.update(members).set({ advanceUsedCents: Math.max(0, m.advanceUsedCents - used) }).where(eq(members.id, memberId)).run();
-}
-
 /**
  * Settles the security deposit: some or all goes back, and anything the space keeps is income. It happens at the end of the plan
  * period (or when the member is no longer active), the same two days' notice as renewing.

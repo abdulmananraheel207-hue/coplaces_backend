@@ -49,7 +49,7 @@ export function locationsRouter(db: Db) {
 
   r.post('/', ownerOnly, async (req, res) => {
     const body = parse(createSchema, req.body);
-    if (body.openTime >= body.closeTime) throw badRequest('Closing time must be after opening time');
+    if (body.openTime === body.closeTime) throw badRequest('Opening and closing time cannot be the same. A closing time before the opening time means the business closes after midnight');
     await assertWithinLimit(db, req.user!, 'locations');
     res.status(201).json(await db.insert(locations).values({ ...body, organizationId: req.user!.organizationId! }).returning().get());
   });
@@ -61,7 +61,7 @@ export function locationsRouter(db: Db) {
     assertLocation(req.user!, current.id);
     const open = body.openTime ?? current.openTime;
     const close = body.closeTime ?? current.closeTime;
-    if (open >= close) throw badRequest('Closing time must be after opening time');
+    if (open === close) throw badRequest('Opening and closing time cannot be the same. A closing time before the opening time means the business closes after midnight');
     res.json(await db.update(locations).set(body).where(eq(locations.id, current.id)).returning().get());
   });
 

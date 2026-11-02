@@ -65,6 +65,7 @@ export const CONTRACT_STATUSES = ['draft', 'active', 'ended', 'cancelled'] as co
 export const REQUEST_STATUSES = ['pending', 'approved', 'rejected', 'cancelled', 'taken'] as const;
 export const BOOKING_SOURCES = ['manual', 'plan'] as const;
 export const PRICING_MODES = ['per_member', 'fixed'] as const;
+export const AMENITY_REQUEST_STATUSES = ['pending', 'served', 'declined', 'cancelled'] as const;
 export const DEPOSIT_STATUSES = ['pending', 'held', 'refunded', 'forfeited'] as const;
 export const DEPOSIT_ENTRY_KINDS = ['received', 'refunded', 'kept', 'advance'] as const;
 export const EXPENSE_CATEGORIES = [
@@ -854,12 +855,41 @@ export const amenityOrders = sqliteTable(
     chargeCents: integer('charge_cents').notNull(),
     /** When the charge was collected from the member. Null while it is still owed. */
     collectedAt: text('collected_at'),
+    /** The invoice the charge was put on. Then the invoice is what the member pays, not a collection at the desk. */
+    invoiceId: text('invoice_id'),
     recordedById: text('recorded_by_id')
       .notNull()
       .references(() => users.id),
     createdAt: createdAt(),
   },
   (t) => [index('amenity_orders_member_idx').on(t.memberId, t.date), index('amenity_orders_location_idx').on(t.locationId, t.date)],
+);
+
+/** A member asking the front desk for an amenity that is part of their free allowance. The front desk serves it, which records it. */
+export const amenityRequests = sqliteTable(
+  'amenity_requests',
+  {
+    id: id(),
+    locationId: text('location_id')
+      .notNull()
+      .references(() => locations.id),
+    memberId: text('member_id')
+      .notNull()
+      .references(() => members.id),
+    amenityId: text('amenity_id')
+      .notNull()
+      .references(() => amenities.id),
+    quantity: integer('quantity').notNull(),
+    status: text('status', { enum: AMENITY_REQUEST_STATUSES }).notNull().default('pending'),
+    /** Why it was declined. */
+    reason: text('reason').notNull().default(''),
+    decidedById: text('decided_by_id').references(() => users.id),
+    decidedAt: text('decided_at'),
+    /** The amenity order made when it was served. */
+    orderId: text('order_id'),
+    createdAt: createdAt(),
+  },
+  (t) => [index('amenity_requests_location_idx').on(t.locationId, t.status), index('amenity_requests_member_idx').on(t.memberId)],
 );
 
 /**

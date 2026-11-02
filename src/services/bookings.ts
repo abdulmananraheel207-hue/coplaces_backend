@@ -1,12 +1,11 @@
 import { and, eq, gt, gte, inArray, isNull, lt, lte, ne, or } from 'drizzle-orm';
 import type { Db, Tx } from '../db/client.js';
 import { attendance, bookings, contractPeople, contractSpaces, locationHolidays, members, plans, resourceAssignments, resources, shiftSpaces, shiftTemplates, users } from '../db/schema.js';
-import { isAssigned, isHourly } from '../catalogue.js';
-import { deskPriceCents, hasExtras, roomPriceCents, type RateCard } from './pricing.js';
+import { isPriced } from '../catalogue.js';
 import { assertLocation, isStaff, type AuthUser } from '../lib/auth.js';
 import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
 import { loadLocation } from '../lib/access.js';
-import { dayRange, localDate, localTime, minutesBetween, monthRange, toMinutes, todayIn, zonedToUtc } from '../lib/time.js';
+import { crossesMidnight, dayRange, fitsBusinessHours, localDate, localTime, minutesBetween, monthRange, shiftWindow, spanMinutes, toMinutes, todayIn } from '../lib/time.js';
 
 const LIVE = ['confirmed', 'completed'] as const;
 
@@ -48,10 +47,7 @@ export type PriceBasis =
   | { type: 'plan' }
   | { type: 'minutes'; freeMinutes: number; billableMinutes: number }
   | { type: 'shift'; name: string }
-  | { type: 'hourly'; rateCents: number }
-  | { type: 'daily'; rateCents: number }
-  | { type: 'dayshare'; rateCents: number }
-  | { type: 'rates' };
+  | { type: 'hourly'; rateCents: number };
 
 export interface BookingRequest {
   resourceId: string;
@@ -67,9 +63,8 @@ async function planBooking(tx: Tx, req: BookingRequest, actor: AuthUser, now: Da
     const resource = await tx.select().from(resources).where(eq(resources.id, req.resourceId)).get();
     if (!resource) throw notFound('Resource');
     assertLocation(actor, resource.locationId);
-    if (isAssigned(resource.kind) || (!isHourly(resource.kind) && resource.kind !== 'hot_desk')) {
-      throw badRequest('Dedicated desks, offices, lockers and parking are assigned to members, not booked');
-    }
+    // Only spaces the owner gave an hourly price (on the Pricing tab) are booked by the hour. The rest come with plans and contracts.
+    if (!isPriced(resource)) throw badRequest(`${resource.name} has no hourly price, so it cannot be booked. It is used through plans and contracts. The owner can set a price on the Pricing tab.`);
     if (resource.status !== 'available') throw conflict(`${resource.name} is not available (${resource.status.replace('_', ' ')})`);
 
     const member = await tx.select().from(members).where(eq(members.id, req.memberId)).get();
@@ -89,18 +84,20 @@ async function planBooking(tx: Tx, req: BookingRequest, actor: AuthUser, now: Da
 
     let startTime: string;
     let endTime: string;
-    // Rooms are always booked for a time. A hot desk can be too, from and until, or for the whole day when no times are given.
-    const hourly = isHourly(resource.kind);
-    const timed = hourly || (resource.kind === 'hot_desk' && !!(req.startTime || req.endTime));
+    // Everything is booked for a time, from and until. Only a hot desk can be booked for the whole day by giving no times.
+    const wholeDay = resource.kind === 'hot_desk' && !req.startTime && !req.endTime;
+    const hourly = resource.kind !== 'hot_desk';
+    const timed = !wholeDay;
     if (timed) {
-      if (!req.startTime || !req.endTime) throw badRequest(hourly ? 'startTime and endTime are required for rooms' : 'Give both a from and an until time, or neither for the whole day');
+      if (!req.startTime || !req.endTime) throw badRequest(hourly ? 'startTime and endTime are required' : 'Give both a from and an until time, or neither for the whole day');
       startTime = req.startTime;
       endTime = req.endTime;
-      const dur = toMinutes(endTime) - toMinutes(startTime);
-      if (dur <= 0) throw badRequest('End time must be after start time');
+      // A business that closes after midnight can take a booking that runs past midnight; any other business cannot.
+      const dur = crossesMidnight(openTime, closeTime) ? spanMinutes(startTime, endTime) : toMinutes(endTime) - toMinutes(startTime);
+      if (dur <= 0 || startTime === endTime) throw badRequest('End time must be after start time');
       if (dur % 15 !== 0) throw badRequest('Bookings must be in 15 minute steps');
       if (hourly && dur > 12 * 60) throw badRequest('Bookings are limited to 12 hours');
-      if (toMinutes(startTime) < toMinutes(openTime) || toMinutes(endTime) > toMinutes(closeTime)) {
+      if (!fitsBusinessHours(startTime, endTime, openTime, closeTime)) {
         throw badRequest(`Bookings must be within opening hours (${openTime}–${closeTime})`);
       }
     } else {
@@ -108,8 +105,9 @@ async function planBooking(tx: Tx, req: BookingRequest, actor: AuthUser, now: Da
       endTime = closeTime;
     }
 
-    const startsAt = zonedToUtc(req.date, startTime, tz).toISOString();
-    const endsAt = zonedToUtc(req.date, endTime, tz).toISOString();
+    const window = shiftWindow(req.date, startTime, endTime, tz, openTime, closeTime);
+    const startsAt = window.startsAt.toISOString();
+    const endsAt = window.endsAt.toISOString();
     if (Date.parse(endsAt) <= now.getTime()) throw badRequest('That time has already passed');
 
     // A space rented to a member on a contract is theirs; nobody else can book it while the rent runs.
@@ -187,67 +185,36 @@ async function planBooking(tx: Tx, req: BookingRequest, actor: AuthUser, now: Da
     let priceCents: number;
     let basis: PriceBasis;
 
-    const card: RateCard = resource;
-    const hasPlan = !!plan;
+    const rate = resource.hourlyRateCents;
+    const shift = await matchShift(tx, resource, startTime, endTime, plan?.id ?? null);
 
-    if (resource.kind === 'corporate_room') {
-      // Corporate rooms are premium: always their own rates, never the plan's included minutes.
+    if (resource.kind === 'hot_desk' && plan?.includesHotDesk) {
+      priceCents = 0;
+      billableMinutes = 0;
+      basis = { type: 'plan' };
+    } else if (shift?.priceCents != null) {
+      // A shift with its own price is charged in full and leaves the included minutes alone.
       billableMinutes = duration;
-      const shift = await matchShift(tx, resource, startTime, endTime, plan?.id ?? null);
-      priceCents = shift?.priceCents != null ? shift.priceCents : Math.round(hasExtras(card) ? roomPriceCents(card, startTime, endTime, hasPlan) : (resource.hourlyRateCents * duration) / 60);
-      basis = shift?.priceCents != null ? { type: 'shift', name: shift.name } : hasExtras(card) ? { type: 'rates' } : { type: 'hourly', rateCents: resource.hourlyRateCents };
-    } else if (resource.kind === 'room') {
-      // Included meeting minutes are a monthly allowance; only live bookings consume it.
-      const month = monthRange(localDate(startsAt, tz).slice(0, 7), tz);
-      const used = await tx
-        .select({ startsAt: bookings.startsAt, endsAt: bookings.endsAt, billableMinutes: bookings.billableMinutes })
-        .from(bookings)
-        .innerJoin(resources, eq(resources.id, bookings.resourceId))
-        .where(
-          and(
-            eq(bookings.memberId, member.id),
-            eq(resources.kind, 'room'),
-            inArray(bookings.status, [...LIVE]),
-            gt(bookings.startsAt, month.start),
-            lt(bookings.startsAt, month.end),
-          ),
-        )
-        .all();
-      const freeUsed = used.reduce((sum, b) => sum + (minutesBetween(b.startsAt, b.endsAt) - b.billableMinutes), 0);
-      // The plan's minutes plus the credit hours the owner gave this member (two credit hours are an hour).
-      const freeLeft = Math.max(0, (plan?.includedMeetingMinutes ?? 0) + member.meetingCredits * 30 - freeUsed);
-      billableMinutes = duration - Math.min(duration, freeLeft);
-      // A shift with its own price is charged in full and leaves the included minutes alone. Otherwise only the minutes beyond the allowance are charged, at the booking's own average rate.
-      const shift = await matchShift(tx, resource, startTime, endTime, plan?.id ?? null);
-      if (shift?.priceCents != null) {
-        billableMinutes = duration;
-        priceCents = shift.priceCents;
-        basis = { type: 'shift', name: shift.name };
-      } else {
-        priceCents = Math.round(hasExtras(card) ? (roomPriceCents(card, startTime, endTime, hasPlan) * billableMinutes) / duration : (resource.hourlyRateCents * billableMinutes) / 60);
-        basis = billableMinutes < duration ? { type: 'minutes', freeMinutes: duration - billableMinutes, billableMinutes } : hasExtras(card) ? { type: 'rates' } : { type: 'hourly', rateCents: resource.hourlyRateCents };
-      }
+      priceCents = shift.priceCents;
+      basis = { type: 'shift', name: shift.name };
     } else {
-      const free = plan?.includesHotDesk ?? false;
-      const shift = await matchShift(tx, resource, startTime, endTime, plan?.id ?? null);
-      const day = deskPriceCents(card, hasPlan);
-      if (free) {
-        priceCents = 0;
-        basis = { type: 'plan' };
-      } else if (shift?.priceCents != null) {
-        priceCents = shift.priceCents;
-        basis = { type: 'shift', name: shift.name };
-      } else if (!timed) {
-        priceCents = day;
-        basis = { type: 'daily', rateCents: day };
-      } else {
-        basis = resource.hourlyRateCents > 0 ? { type: 'hourly', rateCents: resource.hourlyRateCents } : { type: 'dayshare', rateCents: day };
-        // Part of a day: the hourly rate when the desk has one, otherwise the day price shared out by the hours, and never more than a day.
-        const dayMinutes = Math.max(1, toMinutes(closeTime) - toMinutes(openTime));
-        const byTime = resource.hourlyRateCents > 0 ? (resource.hourlyRateCents * duration) / 60 : (day * duration) / dayMinutes;
-        priceCents = Math.min(day, Math.round(byTime));
+      // Meeting rooms have a monthly allowance of free minutes (the plan's, plus the credit hours the owner gave this member:
+      // two credit hours are an hour). Only live bookings use it up. Everything else is charged by the hour from the first minute.
+      let freeLeft = 0;
+      if (resource.kind === 'room') {
+        const month = monthRange(localDate(startsAt, tz).slice(0, 7), tz);
+        const used = await tx
+          .select({ startsAt: bookings.startsAt, endsAt: bookings.endsAt, billableMinutes: bookings.billableMinutes })
+          .from(bookings)
+          .innerJoin(resources, eq(resources.id, bookings.resourceId))
+          .where(and(eq(bookings.memberId, member.id), eq(resources.kind, 'room'), inArray(bookings.status, [...LIVE]), gt(bookings.startsAt, month.start), lt(bookings.startsAt, month.end)))
+          .all();
+        const freeUsed = used.reduce((sum, b) => sum + (minutesBetween(b.startsAt, b.endsAt) - b.billableMinutes), 0);
+        freeLeft = Math.max(0, (plan?.includedMeetingMinutes ?? 0) + member.meetingCredits * 30 - freeUsed);
       }
-      billableMinutes = priceCents > 0 ? duration : 0;
+      billableMinutes = duration - Math.min(duration, freeLeft);
+      priceCents = Math.round((rate * billableMinutes) / 60);
+      basis = billableMinutes < duration ? { type: 'minutes', freeMinutes: duration - billableMinutes, billableMinutes } : { type: 'hourly', rateCents: rate };
     }
 
     return {

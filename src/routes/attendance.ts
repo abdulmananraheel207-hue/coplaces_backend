@@ -10,7 +10,7 @@ import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
 import { idParam, queryString } from '../lib/http.js';
 import { dayRange, isValidDate, todayIn } from '../lib/time.js';
 import { parse } from '../lib/validate.js';
-import { checkInMember, closeStaleVisits, finishBookingOnCheckOut } from '../services/checkin.js';
+import { checkInMember, closeStaleVisits, finishBookingOnCheckOut, overstayers } from '../services/checkin.js';
 
 export function attendanceRouter(db: Db) {
   const r = Router();
@@ -39,6 +39,13 @@ export function attendanceRouter(db: Db) {
     }
     const rows = await select().where(and(...conds)).orderBy(desc(attendance.checkInAt)).limit(500).all();
     res.json(rows.map(({ a, ...rest }) => ({ ...a, ...rest })));
+  });
+
+  // Staff: members still in the building after their booking or shift ended.
+  r.get('/overstaying', staffOnly, async (req, res) => {
+    const locationId = requireLocationId(req);
+    await closeStaleVisits(db, locationId);
+    res.json(await overstayers(db, locationId));
   });
 
   r.post('/check-in', async (req, res) => {

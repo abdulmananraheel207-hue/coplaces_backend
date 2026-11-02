@@ -3,7 +3,7 @@ import type { Db } from '../db/client.js';
 import { bookings, locationHolidays, resourceAssignments, resources } from '../db/schema.js';
 import { isAssigned, isHourly } from '../catalogue.js';
 import { loadLocation } from '../lib/access.js';
-import { addDays, daysBetween, localDate, toMinutes, zonedToUtc } from '../lib/time.js';
+import { addDays, businessMinutes, daysBetween, localDate, zonedToUtc } from '../lib/time.js';
 import { weekdayOf } from './bookings.js';
 
 export interface OccupancyItem {
@@ -71,13 +71,13 @@ export async function occupancy(db: Db, locationId: string, from: string, to: st
 
     const mine = live.filter((b) => b.resourceId === r.id);
     if (isHourly(r.kind)) {
-      const perDay = toMinutes(r.closeTime ?? loc.closeTime) - toMinutes(r.openTime ?? loc.openTime);
+      const perDay = businessMinutes(r.openTime ?? loc.openTime, r.closeTime ?? loc.closeTime);
       const available = openHere.length * perDay;
       const booked = mine.reduce((sum, b) => sum + (Date.parse(b.endsAt) - Date.parse(b.startsAt)) / 60_000, 0);
       return { ...base, utilization: available > 0 ? Math.min(1, booked / available) : 0, used: Math.round((booked / 60) * 10) / 10, unit: 'hours' as const };
     }
     // A desk is measured in days, and a part-day booking counts as that part of a day.
-    const perDay = Math.max(1, toMinutes(r.closeTime ?? loc.closeTime) - toMinutes(r.openTime ?? loc.openTime));
+    const perDay = Math.max(1, businessMinutes(r.openTime ?? loc.openTime, r.closeTime ?? loc.closeTime));
     const bookedDays = mine.reduce((sum, b) => sum + Math.min(1, (Date.parse(b.endsAt) - Date.parse(b.startsAt)) / 60_000 / perDay), 0);
     return { ...base, utilization: openHere.length ? Math.min(1, bookedDays / openHere.length) : 0, used: Math.round(bookedDays * 10) / 10, unit: 'days' as const };
   });

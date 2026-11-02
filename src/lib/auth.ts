@@ -66,14 +66,7 @@ export function sessionCookieOptions() {
   };
 }
 
-export async function loadOrgContext(db: Db, organizationId: string): Promise<OrgContext | null> {
-  const row = await db
-    .select({ org: organizations, pkg: packages })
-    .from(organizations)
-    .innerJoin(packages, eq(packages.id, organizations.packageId))
-    .where(eq(organizations.id, organizationId))
-    .get();
-  if (!row) return null;
+function orgContext(row: { org: typeof organizations.$inferSelect; pkg: typeof packages.$inferSelect }): OrgContext {
   return {
     id: row.org.id,
     name: row.org.name,
@@ -90,19 +83,36 @@ export async function loadOrgContext(db: Db, organizationId: string): Promise<Or
   };
 }
 
+export async function loadOrgContext(db: Db, organizationId: string): Promise<OrgContext | null> {
+  const row = await db
+    .select({ org: organizations, pkg: packages })
+    .from(organizations)
+    .innerJoin(packages, eq(packages.id, organizations.packageId))
+    .where(eq(organizations.id, organizationId))
+    .get();
+  return row ? orgContext(row) : null;
+}
+
 export type AuthResult = { user: AuthUser } | { blocked: string };
 
 export async function resolveAuth(db: Db, userId: string): Promise<AuthResult> {
-  const u = await db.select().from(users).where(eq(users.id, userId)).get();
-  if (!u || !u.active) return { blocked: 'Account unavailable' };
+  // The user, their organization and its package in one statement: every request pays for each one the database is asked.
+  const found = await db
+    .select({ u: users, org: organizations, pkg: packages })
+    .from(users)
+    .leftJoin(organizations, eq(organizations.id, users.organizationId))
+    .leftJoin(packages, eq(packages.id, organizations.packageId))
+    .where(eq(users.id, userId))
+    .get();
+  const u = found?.u;
+  if (!found || !u || !u.active) return { blocked: 'Account unavailable' };
 
   if (u.role === 'superadmin') {
     return { user: { id: u.id, email: u.email, name: u.name, role: u.role, permissions: [], locationIds: [], memberId: null, organizationId: null, org: null } };
   }
 
-  if (!u.organizationId) return { blocked: 'Account unavailable' };
-  const org = await loadOrgContext(db, u.organizationId);
-  if (!org) return { blocked: 'Account unavailable' };
+  if (!u.organizationId || !found.org || !found.pkg) return { blocked: 'Account unavailable' };
+  const org = orgContext({ org: found.org, pkg: found.pkg });
   if (org.status === 'suspended' || org.status === 'cancelled') {
     return { blocked: `The subscription for ${org.name} is ${org.status}. Please contact Coplaces support.` };
   }

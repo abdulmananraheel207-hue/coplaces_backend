@@ -47,15 +47,15 @@ describe('hot desks booked from and until', () => {
     await staff.post('/api/bookings').send({ ...b, resourceId: ctx.desk2.id, startTime: '12:00', endTime: '13:00' }).expect(201);
   });
 
-  it('prices a part-day by the hour, never above a day, and free on a plan with hot desks', async () => {
+  it('prices a part-day by the hour, a whole day as the opening hours, and free on a plan with hot desks', async () => {
     const ctx = await setup();
     const staff = await login(ctx.app, 'manager@test.dev');
-    await ctx.db.update(resources).set({ hourlyRateCents: 500, dailyRateCents: 2_500 }).where(eq(resources.id, ctx.desk.id)).run();
+    await ctx.db.update(resources).set({ hourlyRateCents: 500 }).where(eq(resources.id, ctx.desk.id)).run();
     const q = (memberId: string, startTime?: string, endTime?: string) =>
       staff.post('/api/bookings/quote').send({ resourceId: ctx.desk.id, memberId, date: day, startTime, endTime }).expect(200);
     expect((await q(ctx.basic.member.id, '09:00', '12:00')).body.priceCents).toBe(1_500);
-    expect((await q(ctx.basic.member.id, '08:00', '20:00')).body.priceCents).toBe(2_500); // capped at the day
-    expect((await q(ctx.basic.member.id)).body.priceCents).toBe(2_500);
+    expect((await q(ctx.basic.member.id, '08:00', '20:00')).body.priceCents).toBe(6_000); // twelve hours
+    expect((await q(ctx.basic.member.id)).body.priceCents).toBe(6_000);
     expect((await q(ctx.pro.member.id, '09:00', '12:00')).body.priceCents).toBe(0); // Pro includes hot desks
   });
 
@@ -145,8 +145,8 @@ describe('shift templates', () => {
     const quote = (resourceId: string, memberId: string, startTime = '09:00', endTime = '14:00') =>
       owner.post('/api/bookings/quote').send({ resourceId, memberId, date: day, startTime, endTime }).expect(200);
 
-    await ctx.db.update(resources).set({ hourlyRateCents: 500, dailyRateCents: 2_500 }).where(eq(resources.id, ctx.desk.id)).run();
-    expect((await quote(ctx.desk.id, ctx.basic.member.id)).body.priceCents).toBe(2_500); // capped hourly, no shift yet
+    await ctx.db.update(resources).set({ hourlyRateCents: 500 }).where(eq(resources.id, ctx.desk.id)).run();
+    expect((await quote(ctx.desk.id, ctx.basic.member.id)).body.priceCents).toBe(2_500); // five hours by the hour, no shift yet
     await owner.post('/api/shifts').send({ ...slot, name: 'Morning', priceCents: 1_200 }).expect(201);
     expect((await quote(ctx.desk.id, ctx.basic.member.id)).body.priceCents).toBe(1_200);
     await owner.post('/api/shifts').send({ ...slot, name: 'Desk 1 morning', spaceIds: [ctx.desk.id], priceCents: 900 }).expect(201);
@@ -180,7 +180,7 @@ describe('shifts inside plans', () => {
     const owner = await login(ctx.app, 'owner@test.dev');
     const quote = (resourceId: string, memberId: string) =>
       owner.post('/api/bookings/quote').send({ resourceId, memberId, date: day, startTime: '09:00', endTime: '14:00' }).expect(200);
-    await ctx.db.update(resources).set({ hourlyRateCents: 500, dailyRateCents: 2_500 }).where(eq(resources.id, ctx.desk.id)).run();
+    await ctx.db.update(resources).set({ hourlyRateCents: 500 }).where(eq(resources.id, ctx.desk.id)).run();
 
     const shift = await owner
       .post('/api/shifts')

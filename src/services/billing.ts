@@ -1,6 +1,6 @@
 import { and, asc, eq, inArray, isNull, lt, ne, sql } from 'drizzle-orm';
 import type { Db, DbLike } from '../db/client.js';
-import { bookings, contractPeople, contracts, invoiceItems, invoices, locations, members, payments, plans, resources, users } from '../db/schema.js';
+import { amenityOrders, bookings, contractPeople, contracts, invoiceItems, invoices, locations, members, payments, plans, resources, users } from '../db/schema.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { addDays, localDate, localTime, monthRange, todayIn } from '../lib/time.js';
 import { loadLocation } from '../lib/access.js';
@@ -15,6 +15,8 @@ export interface LineItem {
   quantity: number;
   unitPriceCents: number;
   bookingId?: string | undefined;
+  /** An amenity order this line bills, so the order is not billed again. */
+  amenityOrderId?: string | undefined;
 }
 
 export interface NewInvoice {
@@ -79,6 +81,8 @@ export async function createInvoice(db: DbLike, input: NewInvoice): Promise<Invo
       await db.update(bookings).set({ invoiceId: invoice.id }).where(eq(bookings.id, item.bookingId)).run();
     }
   }
+  const amenityIds = input.items.flatMap((i) => (i.amenityOrderId ? [i.amenityOrderId] : []));
+  if (amenityIds.length) await db.update(amenityOrders).set({ invoiceId: invoice.id }).where(inArray(amenityOrders.id, amenityIds)).run();
   return invoice;
 }
 
@@ -141,6 +145,10 @@ export function voidInvoice(db: Db, invoiceId: string) {
     if (inv.paidCents > 0) throw conflict('Remove the payments on this invoice before voiding it');
     // Release bookings so they can be billed on a replacement invoice.
     await tx.update(bookings).set({ invoiceId: null }).where(eq(bookings.invoiceId, inv.id)).run();
+    await tx.update(amenityOrders).set({ invoiceId: null }).where(eq(amenityOrders.invoiceId, inv.id)).run();
+    // Whatever part of the member's advance this invoice used goes back to them, for the next invoice.
+    const used = (await tx.select({ n: sql<number>`coalesce(sum(-${invoiceItems.amountCents}), 0)` }).from(invoiceItems).where(and(eq(invoiceItems.invoiceId, inv.id), lt(invoiceItems.amountCents, 0))).get())?.n ?? 0;
+    if (used > 0) await tx.update(members).set({ advanceUsedCents: sql`max(0, ${members.advanceUsedCents} - ${used})` }).where(eq(members.id, inv.memberId)).run();
     return tx.update(invoices).set({ status: 'void' }).where(eq(invoices.id, inv.id)).returning().get();
   });
 }
@@ -198,11 +206,14 @@ export function generateSubscriptionInvoices(
       }
 
       const items: LineItem[] = [];
-      if (plan && plan.interval === 'month' && plan.priceCents > 0) {
+      // A member on a plan with shifts is billed for each period by the shifts' prices when the period starts. The plan's own price
+      // is only for plans from before shifts, so it is not billed on top of that.
+      if (plan && plan.interval === 'month' && plan.priceCents > 0 && !member.planStart) {
         items.push({ description: `${plan.name} membership — ${monthLabel}`, quantity: 1, unitPriceCents: plan.priceCents });
       }
 
       items.push(...(await bookingItems(tx, [member.id], range, loc.timezone, now)));
+      items.push(...(await amenityItems(tx, [member.id])));
 
       if (items.length === 0) {
         skipped++;
@@ -250,6 +261,7 @@ export function generateSubscriptionInvoices(
       );
       const items: LineItem[] = rent.map((l) => ({ description: `${c.companyName}: ${l.description} — ${monthLabel}`, quantity: 1, unitPriceCents: l.amountCents }));
       items.push(...(await bookingItems(tx, people.map(({ p }) => p.memberId), range, loc.timezone, now)));
+      items.push(...(await amenityItems(tx, people.map(({ p }) => p.memberId))));
       if (!items.length) {
         skipped++;
         continue;
@@ -275,6 +287,20 @@ async function bookingItems(tx: DbLike, memberIds: string[], range: { end: strin
     unitPriceCents: booking.priceCents,
     bookingId: booking.id,
   }));
+}
+
+/** What members were charged for amenities beyond their free amount, not yet collected or on an invoice, as invoice lines. */
+export async function amenityItems(tx: DbLike, memberIds: string[]): Promise<LineItem[]> {
+  const owed = await tx
+    .select()
+    .from(amenityOrders)
+    .where(and(inArray(amenityOrders.memberId, memberIds), isNull(amenityOrders.invoiceId), isNull(amenityOrders.collectedAt), sql`${amenityOrders.chargeCents} > 0`))
+    .orderBy(asc(amenityOrders.date), asc(amenityOrders.createdAt))
+    .all();
+  return owed.map((o) => {
+    const paid = o.quantity - o.freeQuantity;
+    return { description: `${o.name}, ${o.date}`, quantity: paid, unitPriceCents: Math.round(o.chargeCents / paid), amenityOrderId: o.id };
+  });
 }
 
 export function withBalance<T extends Invoice>(inv: T, today: string) {

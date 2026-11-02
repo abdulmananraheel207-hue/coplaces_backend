@@ -24,5 +24,8 @@ export const isAssigned = (kind: string) => kind === 'dedicated_desk' || kind ==
 /** Every kind of space can be rented to one member on a contract. A bookable one then stops being bookable by anyone else. */
 export const isRentable = (_kind: string) => true;
 
+/** A space can be booked by the hour only when the owner has given it an hourly price. Everything else is used through plans and contracts. */
+export const isPriced = (r: { hourlyRateCents: number }) => r.hourlyRateCents > 0;
+
 /** Rooms booked by the hour. Corporate rooms are billed at their own rate and do not use a plan's included minutes. */
 export const isHourly = (kind: string) => kind === 'room' || kind === 'corporate_room';

@@ -95,12 +95,12 @@ export async function setup() {
     .get();
   const desk = await db
     .insert(resources)
-    .values({ locationId: loc.id, kind: 'hot_desk', name: 'Desk 1', dailyRateCents: 2_500 })
+    .values({ locationId: loc.id, kind: 'hot_desk', name: 'Desk 1', hourlyRateCents: 250 })
     .returning()
     .get();
   const desk2 = await db
     .insert(resources)
-    .values({ locationId: loc.id, kind: 'hot_desk', name: 'Desk 2', dailyRateCents: 2_500 })
+    .values({ locationId: loc.id, kind: 'hot_desk', name: 'Desk 2', hourlyRateCents: 250 })
     .returning()
     .get();
   const dedicated = await db

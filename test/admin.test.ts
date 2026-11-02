@@ -16,7 +16,10 @@ describe('locations', () => {
 
     await owner.post('/api/locations').send({ ...body, name: 'Dup' }).expect(409);
     await owner.post('/api/locations').send({ ...body, code: 'ZZ', timezone: 'Mars/Olympus' }).expect(400);
-    await owner.post('/api/locations').send({ ...body, code: 'ZZ', openTime: '18:00', closeTime: '09:00' }).expect(400);
+    await owner.post('/api/locations').send({ ...body, code: 'ZZ', openTime: '09:00', closeTime: '09:00' }).expect(400); // no hours at all
+    // A closing time before the opening time means the business stays open past midnight.
+    await owner.patch(`/api/locations/${loc.id}`).send({ openTime: '18:00', closeTime: '04:00' }).expect(200);
+    await owner.patch(`/api/locations/${loc.id}`).send({ openTime: '08:00', closeTime: '20:00' }).expect(200);
 
     await owner.patch(`/api/locations/${loc.id}`).send({ taxRateBps: 500 }).expect(200);
     await manager.patch(`/api/locations/${loc.id}`).send({ taxRateBps: 0 }).expect(403);

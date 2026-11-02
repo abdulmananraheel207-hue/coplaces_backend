@@ -23,8 +23,6 @@ const fields = z.object({
   name: z.string().trim().min(1).max(100),
   floor: z.string().trim().max(50),
   capacity: z.number().int().min(1).max(500),
-  hourlyRateCents: z.number().int().min(0),
-  dailyRateCents: z.number().int().min(0),
   amenities: z.string().trim().max(300),
   status: z.enum(RESOURCE_STATUSES),
   notes: z.string().trim().max(1000),
@@ -38,21 +36,12 @@ const fields = z.object({
   openTime: z.string().regex(TIME_RE, 'Use HH:mm').nullable(),
   closeTime: z.string().regex(TIME_RE, 'Use HH:mm').nullable(),
   closedWeekdays: z.string().regex(/^([0-6](,[0-6])*)?$/, 'Weekdays are numbers 0 to 6').nullable(),
-  offPeakRateCents: z.number().int().min(0).nullable(),
-  peakStart: z.string().regex(TIME_RE, 'Use HH:mm').nullable(),
-  peakEnd: z.string().regex(TIME_RE, 'Use HH:mm').nullable(),
-  halfDayRateCents: z.number().int().min(0).nullable(),
-  fullDayRateCents: z.number().int().min(0).nullable(),
-  noPlanRateCents: z.number().int().min(0).nullable(),
 });
 
-/** Opening hours and peak hours must be a proper window, and an off-peak rate needs the peak window it is the opposite of. */
-function checkWindows(v: { openTime?: string | null; closeTime?: string | null; peakStart?: string | null; peakEnd?: string | null; offPeakRateCents?: number | null }) {
+/** A space's own opening hours must be a proper window. */
+function checkWindows(v: { openTime?: string | null; closeTime?: string | null }) {
   if ((v.openTime == null) !== (v.closeTime == null)) throw badRequest('Give both an opening and a closing time, or neither');
   if (v.openTime && v.closeTime && v.openTime >= v.closeTime) throw badRequest('Closing time must be after opening time');
-  if ((v.peakStart == null) !== (v.peakEnd == null)) throw badRequest('Give both the start and the end of peak hours, or neither');
-  if (v.peakStart && v.peakEnd && v.peakStart >= v.peakEnd) throw badRequest('Peak hours must end after they start');
-  if (v.offPeakRateCents != null && !v.peakStart) throw badRequest('Set the peak hours that the off-peak rate is the opposite of');
 }
 
 /** Image types that can be stored as a photo of a space, with the first bytes that prove a file really is one. */
@@ -120,7 +109,7 @@ export function resourcesRouter(db: Db) {
   r.post('/', requirePermission('spaces'), async (req, res) => {
     const body = parse(
       fields
-        .partial({ floor: true, capacity: true, hourlyRateCents: true, dailyRateCents: true, amenities: true, status: true, notes: true, style: true, planX: true, planZ: true, planW: true, planD: true, planRot: true, description: true, openTime: true, closeTime: true, closedWeekdays: true, offPeakRateCents: true, peakStart: true, peakEnd: true, halfDayRateCents: true, fullDayRateCents: true, noPlanRateCents: true })
+        .partial({ floor: true, capacity: true, amenities: true, status: true, notes: true, style: true, planX: true, planZ: true, planW: true, planD: true, planRot: true, description: true, openTime: true, closeTime: true, closedWeekdays: true })
         .extend({ locationId: z.string() }),
       req.body,
     );
@@ -129,6 +118,32 @@ export function resourcesRouter(db: Db) {
     if (body.style !== undefined && !isValidStyle(body.kind, body.style)) throw badRequest(`"${body.style}" is not a style of ${body.kind.replace('_', ' ')}`);
     await assertFloorsWithinLimit(db, req.user!, body.locationId, [body.floor ?? '']);
     res.status(201).json(await db.insert(resources).values(body).returning().get());
+  });
+
+  /**
+   * The Pricing tab: the owner gives spaces an hourly price (or takes it away with 0). A space with a price can be booked by the
+   * hour, by staff and by members asking; a space without one is only used through plans and contracts.
+   */
+  r.put('/pricing', requirePermission('plans'), async (req, res) => {
+    const body = parse(
+      z.object({
+        locationId: z.string(),
+        prices: z.array(z.object({ resourceId: z.string(), hourlyRateCents: z.number().int().min(0).max(1_000_000_000_000) })).min(1).max(1000),
+      }),
+      req.body,
+    );
+    assertLocation(req.user!, body.locationId);
+    const ids = [...new Set(body.prices.map((p) => p.resourceId))];
+    const found = await db.select({ id: resources.id, locationId: resources.locationId, hourlyRateCents: resources.hourlyRateCents }).from(resources).where(inArray(resources.id, ids)).all();
+    if (found.length !== ids.length || found.some((f) => f.locationId !== body.locationId)) throw notFound('Space');
+    const changed = body.prices.filter((p) => found.find((f) => f.id === p.resourceId)!.hourlyRateCents !== p.hourlyRateCents);
+    await db.transaction(async (tx) => {
+      // spaces getting the same price go in one statement
+      const byPrice = new Map<number, string[]>();
+      for (const c of changed) byPrice.set(c.hourlyRateCents, [...(byPrice.get(c.hourlyRateCents) ?? []), c.resourceId]);
+      for (const [price, list] of byPrice) await tx.update(resources).set({ hourlyRateCents: price }).where(inArray(resources.id, list)).run();
+    });
+    res.json({ changed: changed.length });
   });
 
   r.patch('/:id', requirePermission('spaces'), async (req, res) => {
@@ -140,7 +155,8 @@ export function resourcesRouter(db: Db) {
     if (body.style !== undefined && !isValidStyle(body.kind ?? current.kind, body.style)) throw badRequest(`"${body.style}" is not a style of ${(body.kind ?? current.kind).replace('_', ' ')}`);
     if (body.status === 'retired' && current.status !== 'retired') await assertRetirable(db, current);
     if (body.floor !== undefined) await assertFloorsWithinLimit(db, req.user!, current.locationId, [body.floor]);
-    res.json(await db.update(resources).set(body).where(eq(resources.id, current.id)).returning().get());
+    // A request that only carried fields that no longer exist (the old price boxes) changes nothing.
+    res.json(Object.keys(body).length ? await db.update(resources).set(body).where(eq(resources.id, current.id)).returning().get() : current);
   });
 
   // ---- Photos of a space. Anyone who can see the location can see them; the spaces permission changes them.

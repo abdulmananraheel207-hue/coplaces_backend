@@ -6,7 +6,8 @@ import { loadLocation, loadMember } from '../lib/access.js';
 import { hasFeature } from '../lib/auth.js';
 import { forbidden } from '../lib/errors.js';
 import { dayRange, localDate, minutesBetween, monthRange, todayIn } from '../lib/time.js';
-import { amenityOwed, memberAllowance } from '../services/amenities.js';
+import { amenityOwed, listAmenityRequests, memberMenu } from '../services/amenities.js';
+import { overstayers } from '../services/checkin.js';
 import { withBalance } from '../services/billing.js';
 import { isWholeDay } from '../services/bookings.js';
 
@@ -93,8 +94,10 @@ export function meRouter(db: Db) {
       today: localDate(now, loc.timezone),
       plan,
       meetingMinutes: { included: (plan?.includedMeetingMinutes ?? 0) + member.meetingCredits * 30, used: usedMinutes },
-      amenities: await memberAllowance(db, member.id, today),
+      amenities: await memberMenu(db, member.id, loc.id, today),
       amenityDueCents: await amenityOwed(db, member.id),
+      amenityRequests: (await listAmenityRequests(db, user, loc.id)).slice(0, 8),
+      overstay: (await overstayers(db, loc.id, member.id, now))[0] ?? null,
       checkedIn,
       upcomingBookings,
       openInvoices: open,

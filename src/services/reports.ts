@@ -7,16 +7,19 @@ import {
   depositEntries,
   expenses,
   invoices,
+  memberShifts,
   members,
   payments,
   plans,
   resourceAssignments,
   resources,
+  shiftTemplates,
   users,
   visitors,
 } from '../db/schema.js';
 import { isHourly } from '../catalogue.js';
 import { amenityFinance } from './amenities.js';
+import { overstayers } from './checkin.js';
 import { loadLocation } from '../lib/access.js';
 import { addDays, addMonths, daysBetween, dayRange, localDate, monthRange, todayIn, zonedToUtc } from '../lib/time.js';
 
@@ -108,21 +111,41 @@ export async function dashboard(db: Db, locationId: string, includeFinance: bool
     dedicatedDesks: { total: total('dedicated_desk'), assigned: assignedOf('dedicated_desk') },
     offices: { total: total('office'), assigned: assignedOf('office') },
     storage: { total: total('storage'), assigned: assignedOf('storage') },
+    overstaying: await overstayers(db, locationId, undefined, now),
   };
 
   let finance = null;
   if (includeFinance) {
-    const mrr = (await db
-      .select({ v: sumOf(plans.priceCents) })
+    // Monthly income to expect. A member with shifts pays for the shifts they took; a plan from before shifts has its own price.
+    const onShifts = await db
+      .select({ memberId: memberShifts.memberId, price: shiftTemplates.priceCents })
+      .from(memberShifts)
+      .innerJoin(shiftTemplates, eq(shiftTemplates.id, memberShifts.shiftId))
+      .innerJoin(members, eq(members.id, memberShifts.memberId))
+      .innerJoin(plans, eq(plans.id, members.planId))
+      .where(and(eq(members.locationId, locationId), eq(members.status, 'active'), eq(plans.interval, 'month')))
+      .all();
+    const withShifts = new Set(onShifts.map((x) => x.memberId));
+    const legacy = await db
+      .select({ id: members.id, price: plans.priceCents })
       .from(members)
       .innerJoin(plans, eq(plans.id, members.planId))
       .where(and(eq(members.locationId, locationId), eq(members.status, 'active'), eq(plans.interval, 'month')))
-      .get())!.v;
-    const collected = (await db
+      .all();
+    const mrr = onShifts.reduce((s, x) => s + (x.price ?? 0), 0) + legacy.filter((x) => !withShifts.has(x.id)).reduce((s, x) => s + x.price, 0);
+    // The same money in as the finance report: payments, plus advances, deposits the space kept and amenities collected at the desk.
+    const paid = (await db
       .select({ v: sumOf(payments.amountCents) })
       .from(payments)
       .where(and(eq(payments.locationId, locationId), gte(payments.paidAt, month.start), lt(payments.paidAt, month.end)))
       .get())!.v;
+    const otherIn = (await db
+      .select({ v: sumOf(depositEntries.amountCents) })
+      .from(depositEntries)
+      .where(and(eq(depositEntries.locationId, locationId), inArray(depositEntries.kind, ['kept', 'advance']), gte(depositEntries.occurredAt, month.start), lt(depositEntries.occurredAt, month.end)))
+      .get())!.v;
+    const atDesk = (await amenityFinance(db, locationId, month.start, month.end)).collected.reduce((s, x) => s + x.amountCents, 0);
+    const collected = paid + otherIn + atDesk;
     const invoiced = (await db
       .select({ v: sumOf(invoices.totalCents) })
       .from(invoices)

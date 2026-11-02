@@ -1,6 +1,6 @@
 import { and, eq, inArray, ne, or, sql } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
-import { amenityOrders, attendance, bookings, contractPeople, contracts, depositEntries, deviceUsers, devicePunches, invoiceItems, invoices, issues, memberDesks, memberShifts, members, payments, resourceAssignments, roomRequests, users, visitors } from '../db/schema.js';
+import { amenityOrders, amenityRequests, attendance, bookings, contractPeople, contracts, depositEntries, deviceUsers, devicePunches, invoiceItems, invoices, issues, memberDesks, memberShifts, members, payments, resourceAssignments, roomRequests, users, visitors } from '../db/schema.js';
 import { loadMember } from '../lib/access.js';
 import { assertLocation, type AuthUser } from '../lib/auth.js';
 import { conflict } from '../lib/errors.js';
@@ -42,6 +42,7 @@ export async function deleteMember(db: Db, actor: AuthUser, memberId: string) {
     }
     await t.delete(bookings).where(eq(bookings.memberId, member.id)).run();
     await t.delete(roomRequests).where(eq(roomRequests.memberId, member.id)).run();
+    await t.delete(amenityRequests).where(eq(amenityRequests.memberId, member.id)).run();
     await t.delete(memberShifts).where(eq(memberShifts.memberId, member.id)).run();
     await t.delete(memberDesks).where(eq(memberDesks.memberId, member.id)).run();
     await t.delete(deviceUsers).where(eq(deviceUsers.userId, user.id)).run();

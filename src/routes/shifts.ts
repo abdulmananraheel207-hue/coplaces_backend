@@ -8,7 +8,8 @@ import { assertLocation } from '../lib/auth.js';
 import { badRequest, notFound } from '../lib/errors.js';
 import { idParam, queryString } from '../lib/http.js';
 import { requirePermission } from '../lib/permissions.js';
-import { TIME_RE, toMinutes } from '../lib/time.js';
+import { fitsBusinessHours, spanMinutes, TIME_RE } from '../lib/time.js';
+import { retimeShiftBookings } from '../services/planBookings.js';
 import { parse } from '../lib/validate.js';
 
 /** Rooms, desks and offices can have shifts. Lockers and parking cannot. */
@@ -26,10 +27,16 @@ const fields = z.object({
   active: z.boolean(),
 });
 
-async function check(db: Db, locationId: string, v: { planId: string | null; spaceIds: string[]; startTime: string; endTime: string }) {
-  const dur = toMinutes(v.endTime) - toMinutes(v.startTime);
-  if (dur <= 0) throw badRequest('A shift must end after it starts');
-  if (dur % 15 !== 0) throw badRequest('Shifts run in 15 minute steps');
+async function check(db: Db, locationId: string, v: { planId: string | null; spaceIds: string[]; startTime: string; endTime: string }, timesChanged = true) {
+  // A shift that ends at or before the time it starts runs past midnight (22:00 to 06:00), and belongs to the business date it starts on.
+  if (v.startTime === v.endTime) throw badRequest('A shift cannot start and end at the same time');
+  if (spanMinutes(v.startTime, v.endTime) % 15 !== 0) throw badRequest('Shifts run in 15 minute steps');
+  if (timesChanged) {
+    const loc = await loadLocation(db, locationId);
+    if (!fitsBusinessHours(v.startTime, v.endTime, loc.openTime, loc.closeTime)) {
+      throw badRequest(`This shift runs outside your business hours (${loc.openTime} to ${loc.closeTime}). Change the business hours in Settings, or choose times inside them.`);
+    }
+  }
   if (v.planId) {
     const p = await db.select({ locationId: plans.locationId }).from(plans).where(eq(plans.id, v.planId)).get();
     if (!p || p.locationId !== locationId) throw notFound('Plan');
@@ -89,7 +96,10 @@ export function shiftsRouter(db: Db) {
     assertLocation(req.user!, cur.locationId);
     const have = (await shape([cur]))[0]!;
     const { spaceIds, ...rest } = body;
-    await check(db, cur.locationId, { planId: cur.planId, startTime: cur.startTime, endTime: cur.endTime, ...rest, spaceIds: spaceIds ?? have.spaceIds });
+    const timesChanged = (rest.startTime !== undefined && rest.startTime !== cur.startTime) || (rest.endTime !== undefined && rest.endTime !== cur.endTime);
+    await check(db, cur.locationId, { planId: cur.planId, startTime: cur.startTime, endTime: cur.endTime, ...rest, spaceIds: spaceIds ?? have.spaceIds }, timesChanged);
+    // The members who already have this shift move to its new times.
+    if (timesChanged) await retimeShiftBookings(db, cur, { startTime: rest.startTime ?? cur.startTime, endTime: rest.endTime ?? cur.endTime });
     // Choosing spaces replaces the older one-space or one-kind scope.
     const patch = { ...rest, ...(spaceIds ? { resourceId: null, kind: null } : {}) };
     const updated = Object.keys(patch).length ? await db.update(shiftTemplates).set(patch).where(eq(shiftTemplates.id, cur.id)).returning().get() : cur;

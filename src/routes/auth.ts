@@ -6,7 +6,7 @@ import type { Db } from '../db/client.js';
 import { locations, users } from '../db/schema.js';
 import {
   authenticate,
-  loadAuthUser,
+  type AuthUser,
   resolveAuth,
   SESSION_COOKIE,
   sessionCookieOptions,
@@ -41,8 +41,7 @@ export function authRouter(db: Db) {
   const r = Router();
   const needAuth = authenticate(db);
 
-  const sessionPayload = async (userId: string) => {
-    const user = (await loadAuthUser(db, userId))!;
+  const sessionPayload = async (user: AuthUser) => {
     const locs = user.locationIds.length
       ? await db.select().from(locations).where(inArray(locations.id, user.locationIds)).orderBy(asc(locations.name)).all()
       : [];
@@ -70,7 +69,7 @@ export function authRouter(db: Db) {
     const access = await resolveAuth(db, row.id);
     if ('blocked' in access) throw new HttpError(403, access.blocked);
     res.cookie(SESSION_COOKIE, signSession(row.id), sessionCookieOptions());
-    res.json(await sessionPayload(row.id));
+    res.json(await sessionPayload(access.user));
   });
 
   r.post('/logout', (_req, res) => {
@@ -79,7 +78,7 @@ export function authRouter(db: Db) {
   });
 
   r.get('/me', needAuth, async (req, res) => {
-    res.json(await sessionPayload(req.user!.id));
+    res.json(await sessionPayload(req.user!));
   });
 
   r.post('/change-password', needAuth, async (req, res) => {

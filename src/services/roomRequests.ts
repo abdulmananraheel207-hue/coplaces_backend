@@ -1,7 +1,7 @@
 import { and, asc, desc, eq, inArray, ne } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import { members, resources, roomRequests, users } from '../db/schema.js';
-import { isHourly } from '../catalogue.js';
+import { isPriced } from '../catalogue.js';
 import { assertLocation, isStaff, type AuthUser } from '../lib/auth.js';
 import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
 import { createBooking, quoteBooking } from './bookings.js';
@@ -34,7 +34,7 @@ export async function createRequest(db: Db, actor: AuthUser, body: RequestTimes 
   const resource = await db.select().from(resources).where(eq(resources.id, body.resourceId)).get();
   if (!resource) throw notFound('Resource');
   assertLocation(actor, resource.locationId);
-  if (!isHourly(resource.kind)) throw badRequest('Members can ask for meeting rooms, board rooms and other rooms. Desks and offices come with a plan.');
+  if (!isPriced(resource)) throw badRequest('That space is not open for booking. Desks and offices come with a plan or contract; the owner decides which spaces can be booked by the hour.');
   // Every rule a real booking has (open hours, closed days, 15 minute steps, a time that is already taken) applies to the ask too.
   await quoteBooking(db, { resourceId: body.resourceId, memberId: actor.memberId, date: body.date, startTime: body.startTime, endTime: body.endTime, notes: body.notes }, actor);
   const mine = await db

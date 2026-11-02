@@ -226,7 +226,7 @@ export async function seedDemo(db: Db, now = new Date()) {
     db.insert(floorObjects).values({ locationId: downtown.id, floor, type, x, z, w, d, rot, label }).run();
 
   const boardroom = await res(downtown.id, 'room', 'Boardroom', { floor: '3', capacity: 12, hourlyRateCents: pkr(4_500), amenities: 'TV screen, Whiteboard, Video-call kit, Air conditioning, Natural light', description: 'Our largest meeting room. A long table for twelve, a wall screen and a camera for calls, and a view over the street.', ...at(8, 2.8, 8.4, 5.6) });
-  const focusA = await res(downtown.id, 'room', 'Focus Room A', { floor: '2', capacity: 4, hourlyRateCents: pkr(2_000), offPeakRateCents: pkr(1_200), peakStart: '09:00', peakEnd: '17:00', halfDayRateCents: pkr(6_500), fullDayRateCents: pkr(11_000), amenities: 'TV screen, Whiteboard, Air conditioning', description: 'A quiet room for four. Cheaper in the evening, with a half-day and a day price.', ...at(6, 1.75, 4.4, 3.5) });
+  const focusA = await res(downtown.id, 'room', 'Focus Room A', { floor: '2', capacity: 4, hourlyRateCents: pkr(2_000), amenities: 'TV screen, Whiteboard, Air conditioning', description: 'A quiet room for four. Cheaper in the evening, with a half-day and a day price.', ...at(6, 1.75, 4.4, 3.5) });
   const focusB = await res(downtown.id, 'room', 'Focus Room B', { floor: '2', style: 'huddle', capacity: 4, hourlyRateCents: pkr(1_500), amenities: 'Screen, Soft seating', ...at(10.5, 1.75, 4.4, 3.5) });
   const booth1 = await res(downtown.id, 'room', 'Phone Booth 1', { floor: '1', style: 'phone_booth', capacity: 1, hourlyRateCents: pkr(800), amenities: 'Soundproof', ...at(5, 1.45, 2.9, 2.9) });
   await res(downtown.id, 'room', 'Phone Booth 2', { floor: '1', style: 'phone_booth', capacity: 1, hourlyRateCents: pkr(800), amenities: 'Soundproof', status: 'maintenance', notes: 'Door hinge being repaired', ...at(8.1, 1.45, 2.9, 2.9) });
@@ -236,10 +236,10 @@ export async function seedDemo(db: Db, now = new Date()) {
   await res(downtown.id, 'corporate_room', 'Training Hall', { floor: '3', style: 'training_hall', capacity: 30, hourlyRateCents: pkr(12_000), amenities: 'Projector, Stage, PA system', ...at(27, 3.5, 10, 7) });
 
   // Newer kinds of space: a studio, an interview room, a quiet room, a day office, a team pod, lockers, mailboxes, parking.
-  await res(downtown.id, 'room', 'Podcast Studio', { floor: '2', style: 'studio', capacity: 4, hourlyRateCents: pkr(2_500), noPlanRateCents: pkr(3_500), amenities: 'Soundproof, Video-call kit, Power sockets', description: 'Soundproofed, with four microphones and a mixing desk. Bring a laptop and record.', ...at(24, 2.2, 4.4, 3.6) });
+  await res(downtown.id, 'room', 'Podcast Studio', { floor: '2', style: 'studio', capacity: 4, hourlyRateCents: pkr(2_500), amenities: 'Soundproof, Video-call kit, Power sockets', description: 'Soundproofed, with four microphones and a mixing desk. Bring a laptop and record.', ...at(24, 2.2, 4.4, 3.6) });
   await res(downtown.id, 'room', 'Interview Room', { floor: '2', style: 'interview', capacity: 3, hourlyRateCents: pkr(1_000), amenities: 'Air conditioning, Natural light', ...at(29, 2, 3.4, 2.9) });
   await res(downtown.id, 'room', 'Quiet Room', { floor: '2', style: 'focus', capacity: 1, hourlyRateCents: pkr(900), openTime: '10:00', closeTime: '18:00', amenities: 'Soundproof, Power sockets', description: 'One desk, a door and silence. Open 10:00 to 18:00.', ...at(32.5, 2, 2.9, 2.9) });
-  await res(downtown.id, 'hot_desk', 'Day Office 1', { floor: '1', style: 'day_office', capacity: 3, dailyRateCents: pkr(4_500), amenities: 'Power sockets, Air conditioning, Wi-Fi', description: 'A private room for up to three, booked for the day.', ...at(23, 4, 4, 3.2) });
+  await res(downtown.id, 'hot_desk', 'Day Office 1', { floor: '1', style: 'day_office', capacity: 3, hourlyRateCents: pkr(600), amenities: 'Power sockets, Air conditioning, Wi-Fi', description: 'A private room for up to three, booked for the day.', ...at(23, 4, 4, 3.2) });
   await res(downtown.id, 'dedicated_desk', 'Team Pod A', { floor: '2', style: 'team_pod', capacity: 4, amenities: 'Power sockets, Monitor', ...at(24, 8, 3.4, 3.2) });
   const lockers = await mapSeq(range(6), (i) => res(downtown.id, 'storage', `Locker ${i + 1}`, { floor: '1', style: 'locker', ...at(14 + i * 1, 12.9, 0.9, 0.9) }));
   const bays = await mapSeq(range(3), (i) => res(downtown.id, 'storage', `Parking Bay ${i + 1}`, { floor: '', style: 'parking', ...at(4 + i * 3, 3, 2.6, 5) }));
@@ -249,7 +249,7 @@ export async function seedDemo(db: Db, now = new Date()) {
     res(downtown.id, 'hot_desk', `Hot Desk ${i + 1}`, {
       floor: '1',
       style: i >= 10 ? 'standing' : i >= 8 ? 'corner' : 'standard',
-      dailyRateCents: pkr(1_500),
+      hourlyRateCents: pkr(200),
       amenities: i >= 10 ? 'Height adjustable, Power' : 'Monitor arm, Power',
       ...pod(i % 4, 1 + Math.floor(i / 4) * 5, 5.5),
     }),
@@ -301,7 +301,7 @@ export async function seedDemo(db: Db, now = new Date()) {
   await object('3', 'mail_room', 33.5, 11.2, 2.4, 1.8);
   await object('', 'terrace', 12, 10.5, 5, 3);
   await res(riverside.id, 'room', 'Minar Room', { floor: '1', capacity: 8, hourlyRateCents: pkr(3_500), amenities: 'Screen, Whiteboard' });
-  for (let i = 1; i <= 6; i++) await res(riverside.id, 'hot_desk', `Hot Desk ${i}`, { floor: '1', dailyRateCents: pkr(1_200) });
+  for (let i = 1; i <= 6; i++) await res(riverside.id, 'hot_desk', `Hot Desk ${i}`, { floor: '1', hourlyRateCents: pkr(150) });
   for (let i = 1; i <= 4; i++) await res(riverside.id, 'dedicated_desk', `Desk D${i}`, { floor: '1' });
 
   // ---- Members -----------------------------------------------------------
@@ -637,7 +637,7 @@ export async function seedDemo(db: Db, now = new Date()) {
     const ded = await plan(loc.id, 'Dedicated Desk', 28_000, { includesHotDesk: true, includedMeetingMinutes: 480 });
     await res(loc.id, 'room', 'Meeting Room', { floor: '1', capacity: 8, hourlyRateCents: pkr(3_000), amenities: 'Screen, Whiteboard' });
     await res(loc.id, 'room', 'Huddle Room', { floor: '1', capacity: 4, hourlyRateCents: pkr(1_500), amenities: 'Whiteboard' });
-    for (let i = 1; i <= 6; i++) await res(loc.id, 'hot_desk', `Hot Desk ${i}`, { floor: '1', dailyRateCents: pkr(1_200) });
+    for (let i = 1; i <= 6; i++) await res(loc.id, 'hot_desk', `Hot Desk ${i}`, { floor: '1', hourlyRateCents: pkr(150) });
     for (let i = 1; i <= 2; i++) await res(loc.id, 'dedicated_desk', `Desk D${i}`, { floor: '2' });
     await res(loc.id, 'office', 'Office 1', { floor: '2', capacity: 4 });
 

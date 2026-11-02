@@ -139,3 +139,54 @@ export function addMonthsToDate(date: string, n: number): string {
   const lastDay = new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth() + 1, 0)).getUTCDate();
   return new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth(), Math.min(d, lastDay))).toISOString().slice(0, 10);
 }
+
+/**
+ * Business hours. A business day runs from `open` to `close` on the same date, or past midnight when `close` is not after `open`
+ * (open 18:00, close 04:00). Everything that happens before the closing time belongs to the date the business day started.
+ */
+export const crossesMidnight = (open: string, close: string) => toMinutes(close) <= toMinutes(open);
+
+/** How long a business day is open, in minutes. */
+export function businessMinutes(open: string, close: string) {
+  const d = toMinutes(close) - toMinutes(open);
+  return d > 0 ? d : d + 1440;
+}
+
+/** The business date an instant belongs to: the small hours of a night business still count as the day before. */
+export function businessDateOf(instant: Date | string, tz: string, open: string, close: string): string {
+  const date = localDate(instant, tz);
+  return crossesMidnight(open, close) && toMinutes(localTime(instant, tz)) < toMinutes(close) ? addDays(date, -1) : date;
+}
+
+/** Whether a wall time is inside business hours, counting past-midnight hours. */
+export function isOpenAt(time: string, open: string, close: string) {
+  const t = toMinutes(time);
+  return crossesMidnight(open, close) ? t >= toMinutes(open) || t < toMinutes(close) : t >= toMinutes(open) && t < toMinutes(close);
+}
+
+/** A shift or booking that ends at or before the time it starts runs past midnight, into the next calendar date. */
+export const endsNextDay = (start: string, end: string) => toMinutes(end) <= toMinutes(start);
+
+/** How long something from `start` to `end` lasts, in minutes, going past midnight when it has to. */
+export function spanMinutes(start: string, end: string) {
+  const d = toMinutes(end) - toMinutes(start);
+  return d > 0 ? d : d + 1440;
+}
+
+/** The instant a shift that starts on `date` at `start` ends, a day later when it runs past midnight. */
+export const spanEnd = (date: string, start: string, end: string, tz: string) => zonedToUtc(endsNextDay(start, end) ? addDays(date, 1) : date, end, tz);
+
+/** Whether a span (start to end on one business date) lies inside the business hours. Spans are measured from opening time, so past-midnight hours work. */
+export function fitsBusinessHours(start: string, end: string, open: string, close: string) {
+  const from = (toMinutes(start) - toMinutes(open) + 1440) % 1440;
+  return from + spanMinutes(start, end) <= businessMinutes(open, close);
+}
+
+/**
+ * When a shift on business date `date` runs. In a business that closes after midnight, a shift that starts in the small hours
+ * (before the opening time) is the tail of that business day, so it falls on the next calendar date.
+ */
+export function shiftWindow(date: string, start: string, end: string, tz: string, open: string, close: string) {
+  const startDate = crossesMidnight(open, close) && toMinutes(start) < toMinutes(open) ? addDays(date, 1) : date;
+  return { startsAt: zonedToUtc(startDate, start, tz), endsAt: spanEnd(startDate, start, end, tz) };
+}

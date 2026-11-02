@@ -88,8 +88,7 @@ describe('room requests', () => {
   it('refuses what a booking would refuse: desks, offices, a taken time, a repeat ask, odd times', async () => {
     const ctx = await setup();
     const pro = await login(ctx.app, 'pro@test.dev');
-    await ask(pro, ctx.desk.id).expect(400); // desks come with a plan
-    await ask(pro, ctx.dedicated.id).expect(400);
+    await ask(pro, ctx.dedicated.id).expect(400); // no hourly price, so it is only for plans and contracts
     await ask(pro, ctx.room.id, '10:00', '10:10').expect(400); // not in 15 minute steps
     await ask(pro, ctx.room.id, '11:00', '10:00').expect(400);
     await ask(pro, ctx.room.id, '10:00', '11:00', inDays(-1)).expect(400); // already gone

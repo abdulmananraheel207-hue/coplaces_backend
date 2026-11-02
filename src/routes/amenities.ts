@@ -4,12 +4,12 @@ import { z } from 'zod';
 import type { Db } from '../db/client.js';
 import { amenities, amenityOrders } from '../db/schema.js';
 import { requireLocationId } from '../lib/access.js';
-import { assertLocation } from '../lib/auth.js';
+import { assertLocation, isStaff } from '../lib/auth.js';
 import { notFound } from '../lib/errors.js';
 import { idParam, queryString } from '../lib/http.js';
-import { requirePermission } from '../lib/permissions.js';
+import { assertCan, requirePermission } from '../lib/permissions.js';
 import { parse } from '../lib/validate.js';
-import { collectAmenities, giveAmenity, listOrders } from '../services/amenities.js';
+import { cancelAmenityRequest, collectAmenities, declineAmenityRequest, giveAmenity, invoiceAmenities, listAmenityRequests, listOrders, requestAmenity, serveAmenityRequest } from '../services/amenities.js';
 
 const fields = z.object({
   name: z.string().trim().min(1).max(60),
@@ -57,6 +57,37 @@ export function amenitiesRouter(db: Db) {
   r.post('/orders', requirePermission('front_desk'), async (req, res) => {
     const body = parse(z.object({ memberId: z.string(), amenityId: z.string(), quantity: z.number().int().min(1).max(100).default(1) }), req.body);
     res.status(201).json(await giveAmenity(db, req.user!, body));
+  });
+
+  /** Put what a member owes for amenities on an invoice now. */
+  r.post('/invoice', requirePermission('invoices'), async (req, res) => {
+    const body = parse(z.object({ memberId: z.string() }), req.body);
+    res.status(201).json(await invoiceAmenities(db, req.user!, body.memberId));
+  });
+
+  // Members ask for the amenities they get free; the front desk brings them and records it.
+  r.get('/requests', async (req, res) => {
+    const user = req.user!;
+    if (isStaff(user)) assertCan(user, 'front_desk');
+    res.json(await listAmenityRequests(db, user, requireLocationId(req), queryString(req, 'pending') === '1'));
+  });
+
+  r.post('/requests', async (req, res) => {
+    const body = parse(z.object({ amenityId: z.string(), quantity: z.number().int().min(1).max(20).default(1) }), req.body);
+    res.status(201).json(await requestAmenity(db, req.user!, body));
+  });
+
+  r.post('/requests/:id/cancel', async (req, res) => {
+    res.json(await cancelAmenityRequest(db, req.user!, idParam(req)));
+  });
+
+  r.post('/requests/:id/serve', requirePermission('front_desk'), async (req, res) => {
+    res.json(await serveAmenityRequest(db, req.user!, idParam(req)));
+  });
+
+  r.post('/requests/:id/decline', requirePermission('front_desk'), async (req, res) => {
+    const body = parse(z.object({ reason: z.string().trim().max(300).default('') }), req.body);
+    res.json(await declineAmenityRequest(db, req.user!, idParam(req), body.reason));
   });
 
   /** The member paid what they owe for amenities. */

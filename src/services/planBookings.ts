@@ -1,11 +1,11 @@
-import { and, desc, eq, gt, gte, inArray, isNull, lt, ne, or } from 'drizzle-orm';
+import { and, desc, eq, gt, gte, inArray, isNull, lt, lte, ne, or } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
-import { bookings, invoices, memberDesks, memberShifts, members, plans, resourceAssignments, resources, shiftSpaces, shiftTemplates } from '../db/schema.js';
+import { bookings, invoices, locationHolidays, memberDesks, memberShifts, members, plans, resourceAssignments, resources, shiftSpaces, shiftTemplates } from '../db/schema.js';
 import { loadLocation } from '../lib/access.js';
 import { assertLocation, type AuthUser } from '../lib/auth.js';
-import { advanceCredit, releaseAdvance } from './memberMoney.js';
+import { advanceCredit } from './memberMoney.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
-import { addDays, addMonthsToDate, daysBetween, toMinutes, todayIn, zonedToUtc } from '../lib/time.js';
+import { addDays, addMonthsToDate, businessDateOf, daysBetween, localDate, localTime, shiftWindow, spanMinutes, toMinutes, todayIn, zonedToUtc } from '../lib/time.js';
 import { createInvoice, voidInvoice, type LineItem } from './billing.js';
 import { closedReason, weekdayOf } from './bookings.js';
 
@@ -33,8 +33,14 @@ async function loadShifts(db: Db, plan: Plan, shiftIds: string[]) {
   const off = rows.find((s) => !s.active);
   if (off) throw badRequest(`${off.name} is not being offered`);
   const sorted = [...rows].sort((a, b) => a.startTime.localeCompare(b.startTime));
-  for (let i = 1; i < sorted.length; i++) {
-    if (toMinutes(sorted[i]!.startTime) < toMinutes(sorted[i - 1]!.endTime)) throw badRequest(`${sorted[i - 1]!.name} and ${sorted[i]!.name} overlap. Choose shifts that do not run at the same time`);
+  // Shifts that run past midnight are measured on the clock face, so a night shift also clashes with an early morning one.
+  const span = (s: Shift) => [toMinutes(s.startTime), toMinutes(s.startTime) + spanMinutes(s.startTime, s.endTime)] as const;
+  for (let i = 0; i < sorted.length; i++) {
+    for (let j = i + 1; j < sorted.length; j++) {
+      const [a1, a2] = span(sorted[i]!);
+      const [b1, b2] = span(sorted[j]!);
+      if ([-1440, 0, 1440].some((k) => a1 < b2 + k && b1 + k < a2)) throw badRequest(`${sorted[i]!.name} and ${sorted[j]!.name} overlap. Choose shifts that do not run at the same time`);
+    }
   }
   return sorted;
 }
@@ -47,10 +53,12 @@ async function spacesByShift(db: Db, shifts: Shift[]) {
 
 const covers = (s: Shift, listed: string[], space: Space) => (listed.length ? listed.includes(space.id) : s.resourceId ? s.resourceId === space.id : !s.kind || s.kind === space.kind);
 
-/** Days of the period a location is open, as 'YYYY-MM-DD'. */
+/** Days of the period a location is open, as 'YYYY-MM-DD'. One query for the holidays, not one per day. */
 async function openDays(db: Db, loc: Parameters<typeof closedReason>[1], start: string, end: string) {
+  const holidays = new Set((await db.select({ date: locationHolidays.date }).from(locationHolidays).where(and(eq(locationHolidays.locationId, loc.id), gte(locationHolidays.date, start), lte(locationHolidays.date, end))).all()).map((h) => h.date));
+  const weekly = loc.closedWeekdays.split(',');
   const out: string[] = [];
-  for (let d = start; d <= end; d = addDays(d, 1)) if (!(await closedReason(db, loc, d))) out.push(d);
+  for (let d = start; d <= end; d = addDays(d, 1)) if (!holidays.has(d) && !weekly.includes(String(weekdayOf(d)))) out.push(d);
   return out;
 }
 
@@ -70,7 +78,8 @@ export async function freeSpaces(db: Db, locationId: string, shifts: Shift[], st
   if (!candidates.length) return [];
   const ids = candidates.map((r) => r.id);
   const from = zonedToUtc(start, '00:00', loc.timezone).toISOString();
-  const to = zonedToUtc(addDays(end, 1), '00:00', loc.timezone).toISOString();
+  // A night shift on the last day runs into the day after it.
+  const to = zonedToUtc(addDays(end, 2), '00:00', loc.timezone).toISOString();
   const held = await db
     .select({ resourceId: bookings.resourceId, startsAt: bookings.startsAt, endsAt: bookings.endsAt })
     .from(bookings)
@@ -88,8 +97,9 @@ export async function freeSpaces(db: Db, locationId: string, shifts: Shift[], st
     const mine = held.filter((b) => b.resourceId === r.id);
     return daysFor(r, open).every((day) =>
       shifts.every((s) => {
-        const a = zonedToUtc(day, s.startTime, loc.timezone).toISOString();
-        const b = zonedToUtc(day, s.endTime, loc.timezone).toISOString();
+        const w = shiftWindow(day, s.startTime, s.endTime, loc.timezone, loc.openTime, loc.closeTime);
+        const a = w.startsAt.toISOString();
+        const b = w.endsAt.toISOString();
         return mine.filter((x) => x.startsAt < b && x.endsAt > a).length < r.capacity;
       }),
     );
@@ -122,31 +132,21 @@ async function bookPeriod(t: Db, actor: AuthUser, memberId: string, plan: Plan, 
   const open = await openDays(t, loc, period.from, period.end);
   if (!open.length) throw badRequest('The location is closed on every day of that period');
   const note = `${plan.name}: ${shifts.map((s) => s.name).join(', ')}`;
+  // A month of shifts is hundreds of rows. They go in a few statements, not one round trip each: the database is across the internet.
+  const rows: (typeof bookings.$inferInsert)[] = [];
   for (const space of free) {
     for (const day of daysFor(space, open)) {
       for (const s of shifts) {
-        await t
-          .insert(bookings)
-          .values({
-            locationId: loc.id,
-            resourceId: space.id,
-            memberId: member.id,
-            startsAt: zonedToUtc(day, s.startTime, loc.timezone).toISOString(),
-            endsAt: zonedToUtc(day, s.endTime, loc.timezone).toISOString(),
-            billableMinutes: 0,
-            priceCents: 0,
-            notes: note,
-            createdById: actor.id,
-            source: 'plan',
-          })
-          .run();
+        const w = shiftWindow(day, s.startTime, s.endTime, loc.timezone, loc.openTime, loc.closeTime);
+        rows.push({ locationId: loc.id, resourceId: space.id, memberId: member.id, startsAt: w.startsAt.toISOString(), endsAt: w.endsAt.toISOString(), billableMinutes: 0, priceCents: 0, notes: note, createdById: actor.id, source: 'plan' });
       }
     }
   }
+  for (let i = 0; i < rows.length; i += 50) await t.insert(bookings).values(rows.slice(i, i + 50)).run();
   await t.delete(memberShifts).where(eq(memberShifts.memberId, member.id)).run();
   await t.delete(memberDesks).where(eq(memberDesks.memberId, member.id)).run();
-  for (const s of shifts) await t.insert(memberShifts).values({ memberId: member.id, shiftId: s.id }).run();
-  for (const id of wanted) await t.insert(memberDesks).values({ memberId: member.id, resourceId: id }).run();
+  if (shifts.length) await t.insert(memberShifts).values(shifts.map((s) => ({ memberId: member.id, shiftId: s.id }))).run();
+  if (wanted.length) await t.insert(memberDesks).values(wanted.map((id) => ({ memberId: member.id, resourceId: id }))).run();
   await t.update(members).set({ planId: plan.id, planStart: period.start, planEnd: period.end }).where(eq(members.id, member.id)).run();
   return { loc, shifts };
 }
@@ -232,8 +232,7 @@ export async function changePlan(db: Db, actor: AuthUser, memberId: string, inpu
   if (plan && shifts.length) {
     const all = itemsFor(plan, shifts, start, end);
     if (oldInvoice && oldInvoice.status === 'open' && oldInvoice.paidCents === 0) {
-      await releaseAdvance(db, oldInvoice.id, memberId);
-      await voidInvoice(db, oldInvoice.id);
+      await voidInvoice(db, oldInvoice.id); // gives back the advance it used
       invoiceId = (await invoiceItems(db, loc.id, memberId, all, start, loc.timezone))?.id ?? null;
     } else if (samePlan && oldInvoice) {
       // Already paid, or part paid: keep it, and bill only what they now have that they did not.
@@ -243,7 +242,6 @@ export async function changePlan(db: Db, actor: AuthUser, memberId: string, inpu
       invoiceId = (await invoiceItems(db, loc.id, memberId, all, start, loc.timezone))?.id ?? null;
     }
   } else if (oldInvoice && oldInvoice.status === 'open' && oldInvoice.paidCents === 0) {
-    await releaseAdvance(db, oldInvoice.id, memberId);
     await voidInvoice(db, oldInvoice.id);
   }
   return { start, end, invoiceId };
@@ -269,4 +267,50 @@ export function renewPlan(db: Db, actor: AuthUser, memberId: string, startDate?:
     if (start < earliest) throw badRequest(`The next period cannot start before ${earliest}, the day after this one ends`);
     return startPlanPeriod(t, actor, member.id, plan, shiftIds, spaceIds, start);
   });
+}
+
+/**
+ * A shift's times were changed: the bookings its members already have, from now on, move to the new times. Without this the
+ * members keep the old times, and the front desk cannot check them in for the new ones. Days that are already over stay as they were.
+ */
+export async function retimeShiftBookings(db: Db, shift: Shift, next: { startTime: string; endTime: string }, now = new Date()) {
+  if (next.startTime === shift.startTime && next.endTime === shift.endTime) return 0;
+  const loc = await loadLocation(db, shift.locationId);
+  const tz = loc.timezone;
+  const who = (await db.select({ id: memberShifts.memberId }).from(memberShifts).where(eq(memberShifts.shiftId, shift.id)).all()).map((x) => x.id);
+  if (!who.length) return 0;
+  const nowIso = now.toISOString();
+  const rows = await db
+    .select()
+    .from(bookings)
+    .where(and(inArray(bookings.memberId, who), eq(bookings.source, 'plan'), eq(bookings.status, 'confirmed'), gt(bookings.endsAt, nowIso)))
+    .all();
+  const mine = rows.filter((b) => localTime(b.startsAt, tz) === shift.startTime && localTime(b.endsAt, tz) === shift.endTime);
+  if (!mine.length) return 0;
+  const moves = mine.map((b) => {
+    const w = shiftWindow(businessDateOf(b.startsAt, tz, loc.openTime, loc.closeTime), next.startTime, next.endTime, tz, loc.openTime, loc.closeTime);
+    return { b, startsAt: w.startsAt.toISOString(), endsAt: w.endsAt.toISOString() };
+  });
+  // Nobody else may be sitting in the new time.
+  const ids = new Set(mine.map((b) => b.id));
+  const others = await db
+    .select()
+    .from(bookings)
+    .where(and(inArray(bookings.resourceId, [...new Set(mine.map((b) => b.resourceId))]), inArray(bookings.status, ['confirmed', 'completed']), gt(bookings.endsAt, nowIso)))
+    .all();
+  for (const m of moves) {
+    const capacity = (await db.select({ c: resources.capacity, n: resources.name }).from(resources).where(eq(resources.id, m.b.resourceId)).get())!;
+    const taking = others.filter((o) => !ids.has(o.id) && o.resourceId === m.b.resourceId && o.startsAt < m.endsAt && o.endsAt > m.startsAt).length;
+    if (taking >= capacity.c) throw conflict(`${capacity.n} is already booked on ${localDate(m.startsAt, tz)} in the new time, so the shift cannot move`);
+  }
+  // Every booking on one day moves to the same new times, so one statement per day.
+  const byDay = new Map<string, typeof moves>();
+  for (const m of moves) byDay.set(m.startsAt, [...(byDay.get(m.startsAt) ?? []), m]);
+  await db.transaction(async (tx) => {
+    for (const group of byDay.values()) {
+      const first = group[0]!;
+      await tx.update(bookings).set({ startsAt: first.startsAt, endsAt: first.endsAt }).where(inArray(bookings.id, group.map((g) => g.b.id))).run();
+    }
+  });
+  return moves.length;
 }

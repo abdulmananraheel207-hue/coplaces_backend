@@ -90,9 +90,9 @@ describe('room bookings', () => {
     // Rooms are asked for, desks and offices come with a plan: a member books neither directly.
     await agent.post('/api/bookings').send({ resourceId: room.id, date: tomorrow(), startTime: '10:00', endTime: '11:00' }).expect(403);
     await agent.post('/api/bookings').send({ resourceId: desk.id, date: tomorrow() }).expect(403);
-    // They may see what a room would cost, but not a desk's.
+    // They may see what a priced space would cost.
     await agent.post('/api/bookings/quote').send({ resourceId: room.id, date: tomorrow(), startTime: '10:00', endTime: '11:00' }).expect(200);
-    await agent.post('/api/bookings/quote').send({ resourceId: desk.id, date: tomorrow() }).expect(403);
+    await agent.post('/api/bookings/quote').send({ resourceId: desk.id, date: tomorrow() }).expect(200);
 
     const staff = await login(app, 'desk@test.dev');
     const b = await staff.post('/api/bookings').send({ resourceId: room.id, memberId: basic.member.id, date: tomorrow(), startTime: '10:00', endTime: '11:00' }).expect(201);
@@ -135,7 +135,7 @@ describe('desk bookings and assignments', () => {
     await staff.post('/api/bookings').send({ resourceId: desk.id, memberId: basic.member.id, date: day }).expect(409);
 
     const paid = await staff.post('/api/bookings').send({ resourceId: desk2.id, memberId: basic.member.id, date: day }).expect(201);
-    expect(paid.body.priceCents).toBe(2_500);
+    expect(paid.body.priceCents).toBe(3_000); // a whole day is the 12 opening hours at 2.50
   });
 
   it('does not allow booking dedicated desks, and prevents overlapping assignments', async () => {

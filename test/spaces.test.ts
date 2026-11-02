@@ -2,73 +2,35 @@ import { describe, expect, it } from 'vitest';
 import { eq } from 'drizzle-orm';
 import { resources } from '../src/db/schema.js';
 import { addDays, todayIn } from '../src/lib/time.js';
-import { roomPriceCents, type RateCard } from '../src/services/pricing.js';
 import { inDays, login, setup, TZ, tomorrow } from './helpers.js';
 
 const png = () => Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(40, 1)]);
-
-const rack = (over: Partial<RateCard> = {}): RateCard => ({ hourlyRateCents: 6000, dailyRateCents: 2500, offPeakRateCents: null, peakStart: null, peakEnd: null, halfDayRateCents: null, fullDayRateCents: null, noPlanRateCents: null, ...over });
-
-describe('the price of a room', () => {
-  it('is the hourly rate times the hours when nothing else is set', () => {
-    expect(roomPriceCents(rack(), '09:00', '11:30', true)).toBe(15000);
-  });
-
-  it('splits a booking across peak and off-peak hours', () => {
-    const c = rack({ offPeakRateCents: 3000, peakStart: '09:00', peakEnd: '17:00' });
-    expect(roomPriceCents(c, '08:00', '10:00', true)).toBe(9000); // an hour off-peak, an hour peak
-    expect(roomPriceCents(c, '18:00', '19:00', true)).toBe(3000);
-    expect(roomPriceCents(c, '10:00', '12:00', true)).toBe(12000);
-  });
-
-  it('lets a half-day or a day price win only when it is cheaper', () => {
-    const c = rack({ halfDayRateCents: 20000, fullDayRateCents: 25000 });
-    expect(roomPriceCents(c, '09:00', '11:00', true)).toBe(12000); // two hours is cheaper by the hour
-    expect(roomPriceCents(c, '09:00', '13:00', true)).toBe(20000); // four hours: the half day
-    expect(roomPriceCents(c, '09:00', '14:00', true)).toBe(25000); // five hours: the day
-    expect(roomPriceCents(c, '08:00', '20:00', true)).toBe(25000);
-  });
-
-  it('charges members without a plan their own rate', () => {
-    const c = rack({ noPlanRateCents: 9000 });
-    expect(roomPriceCents(c, '09:00', '10:00', true)).toBe(6000);
-    expect(roomPriceCents(c, '09:00', '10:00', false)).toBe(9000);
-  });
-});
 
 describe('pricing, hours and status when booking', () => {
   const book = (agent: Awaited<ReturnType<typeof login>>, ctx: Awaited<ReturnType<typeof setup>>, resourceId: string, memberId: string, date: string, startTime?: string, endTime?: string) =>
     agent.post('/api/bookings').send({ resourceId, memberId, date, startTime, endTime });
 
-  it('prices a booking with peak hours, a half day and a day pass', async () => {
+  it('charges the hourly price by the minute', async () => {
     const ctx = await setup();
     const owner = await login(ctx.app, 'owner@test.dev');
-    await owner.patch(`/api/resources/${ctx.room.id}`).send({ offPeakRateCents: 3000, peakStart: '09:00', peakEnd: '17:00', halfDayRateCents: 20000, fullDayRateCents: 25000 }).expect(200);
-
-    const early = await book(owner, ctx, ctx.room.id, ctx.basic.member.id, inDays(2), '08:00', '10:00').expect(201);
-    expect(early.body.priceCents).toBe(9000);
-    const half = await book(owner, ctx, ctx.room.id, ctx.basic.member.id, inDays(3), '09:00', '13:00').expect(201);
-    expect(half.body.priceCents).toBe(20000);
-    const day = await book(owner, ctx, ctx.room.id, ctx.basic.member.id, inDays(4), '09:00', '15:00').expect(201);
-    expect(day.body.priceCents).toBe(25000);
+    expect((await book(owner, ctx, ctx.room.id, ctx.basic.member.id, inDays(2), '09:00', '10:30').expect(201)).body.priceCents).toBe(9000);
+    expect((await book(owner, ctx, ctx.room.id, ctx.basic.member.id, inDays(3), '09:00', '09:15').expect(201)).body.priceCents).toBe(1500);
   });
 
   it("charges only the minutes beyond a plan's allowance", async () => {
     const ctx = await setup();
     const owner = await login(ctx.app, 'owner@test.dev');
-    await owner.patch(`/api/resources/${ctx.room.id}`).send({ fullDayRateCents: 9000 }).expect(200);
-    // Pro has 60 included minutes. Three hours would be 18000 by the hour, 9000 as a day pass, and one of the three hours is free.
+    // Pro has 60 included minutes: of three hours, one is free and two are charged by the hour.
     const b = await book(owner, ctx, ctx.room.id, ctx.pro.member.id, inDays(2), '09:00', '12:00').expect(201);
     expect(b.body.billableMinutes).toBe(120);
-    expect(b.body.priceCents).toBe(6000);
+    expect(b.body.priceCents).toBe(12000);
   });
 
   it('quotes a booking without making it, with the same price and the same refusals', async () => {
     const ctx = await setup();
     const owner = await login(ctx.app, 'owner@test.dev');
-    await owner.patch(`/api/resources/${ctx.room.id}`).send({ offPeakRateCents: 3000, peakStart: '09:00', peakEnd: '17:00' }).expect(200);
     const quote = await owner.post('/api/bookings/quote').send({ resourceId: ctx.room.id, memberId: ctx.basic.member.id, date: inDays(2), startTime: '08:00', endTime: '10:00' }).expect(200);
-    expect(quote.body).toMatchObject({ priceCents: 9000, billableMinutes: 120 });
+    expect(quote.body).toMatchObject({ priceCents: 12000, billableMinutes: 120 });
     expect(((await owner.get(`/api/bookings?locationId=${ctx.loc.id}`)).body as unknown[]).length).toBe(0);
     const real = await book(owner, ctx, ctx.room.id, ctx.basic.member.id, inDays(2), '08:00', '10:00').expect(201);
     expect(real.body.priceCents).toBe(quote.body.priceCents);
@@ -81,23 +43,27 @@ describe('pricing, hours and status when booking', () => {
     await (await login(ctx.app, 'owner@hive.dev')).post('/api/bookings/quote').send({ resourceId: ctx.room.id, memberId: ctx.pro.member.id, date: inDays(4), startTime: '09:00', endTime: '10:00' }).expect(403);
   });
 
-  it('keeps the old price when no extras are set', async () => {
+  it('prices a desk by the hour too, and a whole day as the opening hours', async () => {
     const ctx = await setup();
     const owner = await login(ctx.app, 'owner@test.dev');
-    const b = await book(owner, ctx, ctx.room.id, ctx.basic.member.id, inDays(2), '09:00', '10:30').expect(201);
-    expect(b.body.priceCents).toBe(9000);
+    // the desk is 2.50 an hour and the building is open 08:00 to 20:00
+    expect((await book(owner, ctx, ctx.desk.id, ctx.basic.member.id, inDays(2), '09:00', '11:00').expect(201)).body.priceCents).toBe(500);
+    expect((await book(owner, ctx, ctx.desk2.id, ctx.basic.member.id, inDays(4)).expect(201)).body.priceCents).toBe(3000);
+    // a plan with hot desks included pays nothing for them
+    expect((await book(owner, ctx, ctx.desk.id, ctx.pro.member.id, inDays(3)).expect(201)).body.priceCents).toBe(0);
   });
 
-  it('charges a member with no plan the no-plan rate, for rooms and desks', async () => {
+  it('cannot book a space that has no hourly price, until the owner gives it one', async () => {
     const ctx = await setup();
     const owner = await login(ctx.app, 'owner@test.dev');
-    const walkIn = await ctx.member('walkin@test.dev', null);
-    await owner.patch(`/api/resources/${ctx.room.id}`).send({ noPlanRateCents: 9000 }).expect(200);
-    await owner.patch(`/api/resources/${ctx.desk.id}`).send({ noPlanRateCents: 4000 }).expect(200);
-    expect((await book(owner, ctx, ctx.room.id, walkIn.member.id, inDays(2), '09:00', '10:00').expect(201)).body.priceCents).toBe(9000);
-    expect((await book(owner, ctx, ctx.room.id, ctx.basic.member.id, inDays(2), '11:00', '12:00').expect(201)).body.priceCents).toBe(6000);
-    expect((await book(owner, ctx, ctx.desk.id, walkIn.member.id, inDays(2)).expect(201)).body.priceCents).toBe(4000);
-    expect((await book(owner, ctx, ctx.desk2.id, ctx.basic.member.id, inDays(2)).expect(201)).body.priceCents).toBe(2500);
+    const office = (await owner.post('/api/resources').send({ locationId: ctx.loc.id, kind: 'office', name: 'Office 9' }).expect(201)).body;
+    const refused = await book(owner, ctx, office.id, ctx.basic.member.id, inDays(2), '09:00', '10:00').expect(400);
+    expect(refused.body.error).toMatch(/no hourly price/);
+    await owner.put('/api/resources/pricing').send({ locationId: ctx.loc.id, prices: [{ resourceId: office.id, hourlyRateCents: 4000 }] }).expect(200);
+    expect((await book(owner, ctx, office.id, ctx.basic.member.id, inDays(2), '09:00', '10:00').expect(201)).body.priceCents).toBe(4000);
+    // taking the price away closes it to new bookings again
+    await owner.put('/api/resources/pricing').send({ locationId: ctx.loc.id, prices: [{ resourceId: office.id, hourlyRateCents: 0 }] }).expect(200);
+    await book(owner, ctx, office.id, ctx.basic.member.id, inDays(3), '09:00', '10:00').expect(400);
   });
 
   it('follows the space’s own opening hours and closed days', async () => {
@@ -116,13 +82,11 @@ describe('pricing, hours and status when booking', () => {
     await book(owner, ctx, ctx.desk.id, ctx.pro.member.id, inDays(3)).expect(201);
   });
 
-  it('refuses a bad window and an off-peak rate with no peak hours', async () => {
+  it('refuses a bad opening window', async () => {
     const ctx = await setup();
     const owner = await login(ctx.app, 'owner@test.dev');
     await owner.patch(`/api/resources/${ctx.room.id}`).send({ openTime: '18:00', closeTime: '09:00' }).expect(400);
     await owner.patch(`/api/resources/${ctx.room.id}`).send({ openTime: '09:00' }).expect(400);
-    await owner.patch(`/api/resources/${ctx.room.id}`).send({ offPeakRateCents: 1000 }).expect(400);
-    await owner.patch(`/api/resources/${ctx.room.id}`).send({ peakStart: '17:00', peakEnd: '09:00' }).expect(400);
     await owner.patch(`/api/resources/${ctx.room.id}`).send({ closedWeekdays: '9' }).expect(400);
   });
 

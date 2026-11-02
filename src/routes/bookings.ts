@@ -7,7 +7,7 @@ import { loadLocation, requireLocationId } from '../lib/access.js';
 import { assertLocation, isStaff } from '../lib/auth.js';
 import { assertCan, requirePermission } from '../lib/permissions.js';
 import { badRequest, forbidden, notFound } from '../lib/errors.js';
-import { isHourly } from '../catalogue.js';
+import { isPriced } from '../catalogue.js';
 import { idParam, queryString } from '../lib/http.js';
 import { addDays, dayRange, isValidDate, TIME_RE, todayIn, zonedToUtc } from '../lib/time.js';
 import { byName } from '../lib/sort.js';
@@ -18,8 +18,8 @@ const dateStr = z.string().refine(isValidDate, 'Use YYYY-MM-DD');
 const timeStr = z.string().regex(TIME_RE, 'Use HH:mm');
 
 async function assertRoomOnly(db: Db, resourceId: string) {
-  const r = await db.select({ kind: resources.kind }).from(resources).where(eq(resources.id, resourceId)).get();
-  if (r && !isHourly(r.kind)) throw forbidden('Desks and offices come with a plan, so members cannot book them');
+  const r = await db.select({ hourlyRateCents: resources.hourlyRateCents }).from(resources).where(eq(resources.id, resourceId)).get();
+  if (r && !isPriced(r)) throw forbidden('That space has no hourly price, so it cannot be asked for. It is used through plans and contracts.');
 }
 
 export function bookingsRouter(db: Db) {
@@ -37,9 +37,10 @@ export function bookingsRouter(db: Db) {
     const bookable = (await db
       .select()
       .from(resources)
-      .where(and(eq(resources.locationId, locationId), inArray(resources.kind, ['room', 'corporate_room', 'hot_desk'])))
+      .where(eq(resources.locationId, locationId))
       .all())
-      .filter((x) => x.status !== 'retired')
+      // Only spaces with an hourly price are booked by the hour, so only those are on the booking grid.
+      .filter((x) => x.status !== 'retired' && isPriced(x))
       .sort((a, b) => byName(a.name, b.name));
     const rows = await db
       .select({ b: bookings, memberName: users.name })
