@@ -116,16 +116,17 @@ describe('financeCore returns exactly what the endpoints return today', () => {
 });
 
 describe('where today’s definitions differ from the correct ones', () => {
-  it('D1 outstanding: a payment dated in the future already counts today; as of today it does not', async () => {
+  it('D1 outstanding (fixed by H5b): a payment cannot be dated in the future, so outstanding now and as of today agree', async () => {
     const c2 = await setup();
     const owner = await ownerOf(c2);
     const inv = await manualInvoice(owner, c2.basic.member.id, 10_000); // 11,000
-    await owner.post(`/api/invoices/${inv.id}/payments`).send({ amountCents: 4_000, method: 'cash', paidAt: new Date(Date.now() + 3 * 86_400_000).toISOString() }).expect(201);
+    await owner.post(`/api/invoices/${inv.id}/payments`).send({ amountCents: 4_000, method: 'cash', paidAt: new Date(Date.now() + 3 * 86_400_000).toISOString() }).expect(400);
+    await owner.post(`/api/invoices/${inv.id}/payments`).send({ amountCents: 4_000, method: 'cash' }).expect(201);
     const rows2 = await rowsOf(c2, c2.loc.id);
     const d = (await owner.get(`/api/reports/dashboard?locationId=${c2.loc.id}`).expect(200)).body.finance;
     expect(d.outstandingCents).toBe(core.outstandingCents(rows2.invoices));
     expect(core.outstandingCents(rows2.invoices)).toBe(7_000);
-    expect(core.outstandingAsOf(rows2.invoices, rows2.payments, today(), TZ)).toBe(11_000);
+    expect(core.outstandingAsOf(rows2.invoices, rows2.payments, today(), TZ)).toBe(7_000);
   });
 
   it('D2 aging (R4a): a report that ends last month still ages today’s invoices', async () => {

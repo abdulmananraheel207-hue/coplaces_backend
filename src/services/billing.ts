@@ -1,12 +1,13 @@
 import { and, asc, eq, inArray, isNull, lt, ne, sql } from 'drizzle-orm';
 import type { Db, DbLike } from '../db/client.js';
-import { amenityOrders, bookings, contractPeople, contracts, invoiceItems, invoices, locations, members, payments, plans, resources, users } from '../db/schema.js';
+import { LINE_CATEGORIES, amenityOrders, bookings, contractPeople, contracts, invoiceItems, invoices, locations, members, payments, plans, resources, users } from '../db/schema.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { INVOICE_MAX, MONEY_MAX, QUANTITY_MAX } from '../lib/money.js';
 import { addDays, localDate, localTime, monthRange, todayIn } from '../lib/time.js';
 import { loadLocation } from '../lib/access.js';
 import { monthCharges } from './contractPricing.js';
 import { seatsOf } from './companyContracts.js';
+import { audit } from './audit.js';
 
 export type Invoice = typeof invoices.$inferSelect;
 export type PaymentMethod = (typeof payments.$inferSelect)['method'];
@@ -18,7 +19,13 @@ export interface LineItem {
   bookingId?: string | undefined;
   /** An amenity order this line bills, so the order is not billed again. */
   amenityOrderId?: string | undefined;
+  /** What the line is for; `manual` when not given. */
+  category?: LineCategory | undefined;
+  resourceId?: string | null | undefined;
+  planId?: string | null | undefined;
 }
+
+export type LineCategory = (typeof LINE_CATEGORIES)[number];
 
 export interface NewInvoice {
   locationId: string;
@@ -29,6 +36,10 @@ export interface NewInvoice {
   periodStart?: string | undefined;
   items: LineItem[];
   notes?: string | undefined;
+  /** The contract a rent invoice is for. */
+  contractId?: string | undefined;
+  /** Who made it, for the audit log. Every invoice made on someone's behalf is logged. */
+  actorId?: string | undefined;
 }
 
 /** Refuses lines whose amounts, or whose total, could not be held exactly. Checked before anything is multiplied. */
@@ -75,6 +86,7 @@ export async function createInvoice(db: DbLike, input: NewInvoice): Promise<Invo
       dueDate: input.dueDate,
       periodStart: input.periodStart ?? null,
       taxRateBps: loc.taxRateBps,
+      contractId: input.contractId ?? null,
       notes: input.notes ?? '',
       ...totals,
     })
@@ -90,6 +102,9 @@ export async function createInvoice(db: DbLike, input: NewInvoice): Promise<Invo
         unitPriceCents: item.unitPriceCents,
         amountCents: item.quantity * item.unitPriceCents,
         bookingId: item.bookingId ?? null,
+        category: item.category ?? 'manual',
+        resourceId: item.resourceId ?? null,
+        planId: item.planId ?? null,
       })
       .run();
     if (item.bookingId) {
@@ -98,8 +113,22 @@ export async function createInvoice(db: DbLike, input: NewInvoice): Promise<Invo
   }
   const amenityIds = input.items.flatMap((i) => (i.amenityOrderId ? [i.amenityOrderId] : []));
   if (amenityIds.length) await db.update(amenityOrders).set({ invoiceId: invoice.id }).where(inArray(amenityOrders.id, amenityIds)).run();
+  if (input.actorId) {
+    await audit(db, {
+      organizationId: loc.organizationId,
+      locationId: loc.id,
+      actorId: input.actorId,
+      action: 'invoice.create',
+      entity: 'invoice',
+      entityId: invoice.id,
+      amountCents: invoice.totalCents,
+      data: { number: invoice.number, kind: invoice.kind, memberId: invoice.memberId, contractId: invoice.contractId, items: input.items.map((i) => ({ description: i.description, quantity: i.quantity, unitPriceCents: i.unitPriceCents, category: i.category ?? 'manual' })) },
+    });
+  }
   return invoice;
 }
+
+const orgOf = async (db: DbLike, locationId: string) => (await db.select({ o: locations.organizationId }).from(locations).where(eq(locations.id, locationId)).get())?.o ?? null;
 
 /** Re-derives paidCents and status from the payments ledger. */
 export async function recomputeInvoice(db: DbLike, invoiceId: string): Promise<Invoice> {
@@ -139,31 +168,71 @@ export function recordPayment(
       .values({ ...p, locationId: inv.locationId, memberId: inv.memberId })
       .returning()
       .get();
+    await audit(tx, { organizationId: await orgOf(tx, inv.locationId), locationId: inv.locationId, actorId: p.recordedById, action: 'payment.record', entity: 'payment', entityId: payment.id, amountCents: payment.amountCents, data: { invoiceId: inv.id, number: inv.number, method: p.method, paidAt: p.paidAt, reference: p.reference } });
     return { payment, invoice: await recomputeInvoice(tx, inv.id) };
   });
 }
 
-export function deletePayment(db: Db, paymentId: string) {
+/**
+ * Takes a payment back. Nothing is deleted: a reversal row with the negative amount is written, dated now, and the original is
+ * marked reversed. So the month the money came in keeps its figures, and the month it went back shows it going back.
+ */
+export function reversePayment(db: Db, paymentId: string, actorId: string, reason = '') {
   return db.transaction(async (tx) => {
     const pay = await tx.select().from(payments).where(eq(payments.id, paymentId)).get();
     if (!pay) throw notFound('Payment');
-    await tx.delete(payments).where(eq(payments.id, paymentId)).run();
+    if (pay.reversesPaymentId) throw conflict('This is a reversal; it cannot be reversed itself');
+    if (pay.reversedAt) throw conflict('This payment was already reversed');
+    const now = new Date().toISOString();
+    const reversal = await tx
+      .insert(payments)
+      .values({
+        locationId: pay.locationId,
+        invoiceId: pay.invoiceId,
+        memberId: pay.memberId,
+        amountCents: -pay.amountCents,
+        method: pay.method,
+        paidAt: now,
+        reference: pay.reference,
+        notes: reason || 'Payment reversed',
+        recordedById: actorId,
+        reversesPaymentId: pay.id,
+      })
+      .returning()
+      .get();
+    await tx.update(payments).set({ reversedAt: now, reversedById: actorId }).where(eq(payments.id, pay.id)).run();
+    await audit(tx, { organizationId: await orgOf(tx, pay.locationId), locationId: pay.locationId, actorId, action: 'payment.reverse', entity: 'payment', entityId: pay.id, amountCents: pay.amountCents, data: { reversalId: reversal.id, invoiceId: pay.invoiceId, method: pay.method, paidAt: pay.paidAt, reason } });
     return recomputeInvoice(tx, pay.invoiceId);
   });
 }
 
-export function voidInvoice(db: Db, invoiceId: string) {
-  return db.transaction(async (tx) => {
+/**
+ * Gives back what an invoice's advance and credit lines took, to whoever it came from: the contract for a contract's rent invoice,
+ * otherwise the member. Used when an invoice is voided.
+ */
+async function releaseCredits(tx: DbLike, inv: Invoice) {
+  const lines = await tx.select().from(invoiceItems).where(and(eq(invoiceItems.invoiceId, inv.id), lt(invoiceItems.amountCents, 0))).all();
+  const taken = (category: LineCategory) => -lines.filter((l) => l.category === category).reduce((sum, l) => sum + l.amountCents, 0);
+  const advance = taken('advance');
+  const credit = taken('credit');
+  if (advance > 0 && inv.contractId) await tx.update(contracts).set({ advanceUsedCents: sql`max(0, ${contracts.advanceUsedCents} - ${advance})` }).where(eq(contracts.id, inv.contractId)).run();
+  else if (advance > 0) await tx.update(members).set({ advanceUsedCents: sql`max(0, ${members.advanceUsedCents} - ${advance})` }).where(eq(members.id, inv.memberId)).run();
+  if (credit > 0) await tx.update(members).set({ creditUsedCents: sql`max(0, ${members.creditUsedCents} - ${credit})` }).where(eq(members.id, inv.memberId)).run();
+}
+
+/** Voids an unpaid invoice. Works inside a transaction too (it then runs as a savepoint of it). */
+export function voidInvoice(db: DbLike, invoiceId: string, actorId?: string) {
+  return (db as Db).transaction(async (tx) => {
     const inv = await tx.select().from(invoices).where(eq(invoices.id, invoiceId)).get();
     if (!inv) throw notFound('Invoice');
     if (inv.status === 'void') throw conflict('Invoice is already void');
-    if (inv.paidCents > 0) throw conflict('Remove the payments on this invoice before voiding it');
-    // Release bookings so they can be billed on a replacement invoice.
+    if (inv.paidCents > 0) throw conflict('Reverse the payments on this invoice before voiding it');
+    // Release bookings and amenities so they can be billed on a replacement invoice.
     await tx.update(bookings).set({ invoiceId: null }).where(eq(bookings.invoiceId, inv.id)).run();
     await tx.update(amenityOrders).set({ invoiceId: null }).where(eq(amenityOrders.invoiceId, inv.id)).run();
-    // Whatever part of the member's advance this invoice used goes back to them, for the next invoice.
-    const used = (await tx.select({ n: sql<number>`coalesce(sum(-${invoiceItems.amountCents}), 0)` }).from(invoiceItems).where(and(eq(invoiceItems.invoiceId, inv.id), lt(invoiceItems.amountCents, 0))).get())?.n ?? 0;
-    if (used > 0) await tx.update(members).set({ advanceUsedCents: sql`max(0, ${members.advanceUsedCents} - ${used})` }).where(eq(members.id, inv.memberId)).run();
+    // Whatever advance or credit this invoice used goes back, for the next invoice.
+    await releaseCredits(tx, inv);
+    if (actorId) await audit(tx, { organizationId: await orgOf(tx, inv.locationId), locationId: inv.locationId, actorId, action: 'invoice.void', entity: 'invoice', entityId: inv.id, amountCents: inv.totalCents, data: { number: inv.number } });
     return tx.update(invoices).set({ status: 'void' }).where(eq(invoices.id, inv.id)).returning().get();
   });
 }
@@ -174,7 +243,7 @@ export function voidInvoice(db: Db, invoiceId: string) {
  */
 export function generateSubscriptionInvoices(
   db: Db,
-  opts: { locationId: string; month: string; dueInDays: number },
+  opts: { locationId: string; month: string; dueInDays: number; actorId?: string | undefined },
   now = new Date(),
 ) {
   return db.transaction(async (tx) => {

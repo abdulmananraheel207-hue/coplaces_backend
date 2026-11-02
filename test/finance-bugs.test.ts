@@ -101,7 +101,7 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect(withRent).toHaveLength(1);
   });
 
-  knownBug('H5a: removing a payment leaves a record of it (no hard delete)', async () => {
+  it('H5a: removing a payment leaves a record of it (no hard delete)', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     const inv = await manualInvoice(owner, ctx.basic.member.id, 10_000);
@@ -111,7 +111,7 @@ describe('KNOWN finance bugs (each fails today; the fix flips it)', () => {
     expect(await rows.payment(ctx, pay.id)).toBeDefined();
   });
 
-  knownBug('H5b: a payment cannot be dated years back or in the future', async () => {
+  it('H5b: a payment cannot be dated years back or in the future', async () => {
     const ctx = await setup();
     const owner = await ownerOf(ctx);
     const inv = await manualInvoice(owner, ctx.basic.member.id, 10_000);

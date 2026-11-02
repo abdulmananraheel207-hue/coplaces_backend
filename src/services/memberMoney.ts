@@ -7,6 +7,7 @@ import { badRequest, conflict } from '../lib/errors.js';
 import { addDays, daysBetween, todayIn } from '../lib/time.js';
 import { loadLocation } from '../lib/access.js';
 import { calcTotals } from './billing.js';
+import { audit } from './audit.js';
 
 /**
  * A member's advance and security deposit.
@@ -27,8 +28,13 @@ export interface MoneyInput {
 /** How many days before a plan period ends the deposit may be settled, the same window as renewing. */
 const SETTLE_DAYS_BEFORE = 2;
 
-const entry = (t: Db, actor: AuthUser, member: { id: string; locationId: string }, kind: 'advance' | 'received' | 'refunded' | 'kept', amountCents: number, method: Method | null, reference: string) =>
-  t.insert(depositEntries).values({ locationId: member.locationId, memberId: member.id, kind, amountCents, method, reference, occurredAt: new Date().toISOString(), recordedById: actor.id }).run();
+const ACTIONS = { advance: 'advance.receive', received: 'deposit.receive', refunded: 'deposit.refund', kept: 'deposit.keep' } as const;
+
+/** One movement of a member's money: written to the ledger the reports read, and to the audit log. */
+async function entry(t: Db, actor: AuthUser, member: { id: string; locationId: string }, kind: 'advance' | 'received' | 'refunded' | 'kept', amountCents: number, method: Method | null, reference: string) {
+  await t.insert(depositEntries).values({ locationId: member.locationId, memberId: member.id, kind, amountCents, method, reference, occurredAt: new Date().toISOString(), recordedById: actor.id }).run();
+  await audit(t, { organizationId: actor.organizationId, locationId: member.locationId, actorId: actor.id, action: ACTIONS[kind], entity: 'member', entityId: member.id, amountCents, data: { method, reference } });
+}
 
 /** Takes what is left of a member's advance off an invoice that is still open and unpaid. */
 async function applyToOpenInvoice(t: Db, memberId: string) {
@@ -46,7 +52,7 @@ async function applyToOpenInvoice(t: Db, memberId: string) {
   const loc = (await t.select().from(locations).where(eq(locations.id, inv.locationId)).get())!;
   // The invoice keeps the tax rate it was issued at, even if the location's rate has changed since.
   const totals = calcTotals([{ description: '', quantity: 1, unitPriceCents: inv.subtotalCents - credit }], inv.taxRateBps ?? loc.taxRateBps);
-  await t.insert(invoiceItems).values({ invoiceId: inv.id, description: 'Advance paid', quantity: 1, unitPriceCents: -credit, amountCents: -credit }).run();
+  await t.insert(invoiceItems).values({ invoiceId: inv.id, description: 'Advance paid', quantity: 1, unitPriceCents: -credit, amountCents: -credit, category: 'advance' }).run();
   await t.update(invoices).set({ ...totals, status: totals.totalCents === 0 ? 'paid' : 'open' }).where(eq(invoices.id, inv.id)).run();
   await t.update(members).set({ advanceUsedCents: m.advanceUsedCents + credit }).where(eq(members.id, memberId)).run();
 }
@@ -78,7 +84,7 @@ export async function advanceCredit(t: Db, memberId: string, grossCents: number)
   const credit = Math.min(Math.max(left, 0), grossCents);
   if (credit <= 0 || !m) return null;
   await t.update(members).set({ advanceUsedCents: m.advanceUsedCents + credit }).where(eq(members.id, memberId)).run();
-  return { description: 'Advance paid', quantity: 1, unitPriceCents: -credit };
+  return { description: 'Advance paid', quantity: 1, unitPriceCents: -credit, category: 'advance' as const };
 }
 
 /**

@@ -10,7 +10,7 @@ import { badRequest, forbidden, notFound } from '../lib/errors.js';
 import { idParam, queryString } from '../lib/http.js';
 import { addDays, isValidDate, MONTH_RE, todayIn } from '../lib/time.js';
 import { parse } from '../lib/validate.js';
-import { money, paymentAmount, QUANTITY_MAX } from '../lib/money.js';
+import { checkPaidAt, money, paymentAmount, QUANTITY_MAX } from '../lib/money.js';
 import { createInvoice, generateSubscriptionInvoices, recordPayment, voidInvoice, withBalance } from '../services/billing.js';
 import { PAYMENT_METHODS } from '../db/schema.js';
 
@@ -105,7 +105,7 @@ export function invoicesRouter(db: Db) {
     if (dueDate < issueDate) throw badRequest('Due date is before issue date');
 
     const inv = await db.transaction((tx) =>
-      createInvoice(tx, { locationId: loc.id, memberId: member.id, kind: 'manual', issueDate, dueDate, items: body.items, notes: body.notes }),
+      createInvoice(tx, { locationId: loc.id, memberId: member.id, kind: 'manual', issueDate, dueDate, items: body.items.map((i) => ({ ...i, category: 'manual' as const })), notes: body.notes, actorId: req.user!.id }),
     );
     res.status(201).json(inv);
   });
@@ -120,7 +120,7 @@ export function invoicesRouter(db: Db) {
       req.body,
     );
     assertLocation(req.user!, body.locationId);
-    const { created, skipped } = await generateSubscriptionInvoices(db, body);
+    const { created, skipped } = await generateSubscriptionInvoices(db, { ...body, actorId: req.user!.id });
     res.status(201).json({ created: created.length, skipped, invoices: created });
   });
 
@@ -128,7 +128,7 @@ export function invoicesRouter(db: Db) {
     const inv = await db.select().from(invoices).where(eq(invoices.id, idParam(req))).get();
     if (!inv) throw notFound('Invoice');
     assertSees(req.user!, inv.locationId, 'Invoice');
-    res.json(await voidInvoice(db, inv.id));
+    res.json(await voidInvoice(db, inv.id, req.user!.id));
   });
 
   r.post('/:id/payments', requirePermission('invoices'), async (req, res) => {
@@ -149,7 +149,7 @@ export function invoicesRouter(db: Db) {
       invoiceId: inv.id,
       amountCents: body.amountCents,
       method: body.method,
-      paidAt: body.paidAt ?? new Date().toISOString(),
+      paidAt: checkPaidAt(body.paidAt),
       reference: body.reference,
       notes: body.notes,
       recordedById: req.user!.id,

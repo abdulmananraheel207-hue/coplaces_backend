@@ -11,6 +11,7 @@ import { requirePermission } from './lib/permissions.js';
 import { HttpError } from './lib/errors.js';
 import { assignmentsRouter, resourcesRouter } from './routes/resources.js';
 import { attendanceRouter } from './routes/attendance.js';
+import { auditRouter } from './routes/audit.js';
 import { authRouter } from './routes/auth.js';
 import { amenitiesRouter } from './routes/amenities.js';
 import { announcementsRouter } from './routes/announcements.js';
@@ -131,6 +132,7 @@ export function createApp(db: Db, opts: { webDist?: string } = {}) {
   api.use('/payments', requireFeature('invoicing'), paymentsRouter(db));
   api.use('/expenses', requireFeature('expenses'), requirePermission('expenses'), expensesRouter(db));
   api.use('/reports', reportsRouter(db));
+  api.use('/audit', auditRouter(db));
   api.use('/me', meRouter(db));
   api.use((_req, _res, next) => next(new HttpError(404, 'Not found')));
   app.use('/api', api);

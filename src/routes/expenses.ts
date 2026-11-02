@@ -9,6 +9,7 @@ import { badRequest, notFound } from '../lib/errors.js';
 import { idParam, queryString } from '../lib/http.js';
 import { isValidDate, todayIn } from '../lib/time.js';
 import { parse } from '../lib/validate.js';
+import { audit } from '../services/audit.js';
 import { positiveMoney } from '../lib/money.js';
 
 const fields = z.object({
@@ -53,15 +54,12 @@ export function expensesRouter(db: Db) {
     );
     assertLocation(req.user!, body.locationId);
     const loc = await loadLocation(db, body.locationId);
-    res
-      .status(201)
-      .json(
-        await db
-          .insert(expenses)
-          .values({ ...body, incurredOn: body.incurredOn ?? todayIn(loc.timezone), createdById: req.user!.id })
-          .returning()
-          .get(),
-      );
+    const made = await db.transaction(async (tx) => {
+      const e = await tx.insert(expenses).values({ ...body, incurredOn: body.incurredOn ?? todayIn(loc.timezone), createdById: req.user!.id }).returning().get();
+      await audit(tx, { organizationId: loc.organizationId, locationId: loc.id, actorId: req.user!.id, action: 'expense.create', entity: 'expense', entityId: e.id, amountCents: e.amountCents, data: e });
+      return e;
+    });
+    res.status(201).json(made);
   });
 
   r.patch('/:id', async (req, res) => {
@@ -69,14 +67,24 @@ export function expensesRouter(db: Db) {
     const e = await db.select().from(expenses).where(eq(expenses.id, idParam(req))).get();
     if (!e) throw notFound('Expense');
     assertSees(req.user!, e.locationId, 'Expense');
-    res.json(await db.update(expenses).set(body).where(eq(expenses.id, e.id)).returning().get());
+    res.json(
+      await db.transaction(async (tx) => {
+        const after = await tx.update(expenses).set(body).where(eq(expenses.id, e.id)).returning().get();
+        await audit(tx, { organizationId: req.user!.organizationId, locationId: e.locationId, actorId: req.user!.id, action: 'expense.update', entity: 'expense', entityId: e.id, amountCents: after.amountCents, data: { before: e, after } });
+        return after;
+      }),
+    );
   });
 
   r.delete('/:id', async (req, res) => {
     const e = await db.select().from(expenses).where(eq(expenses.id, idParam(req))).get();
     if (!e) throw notFound('Expense');
     assertSees(req.user!, e.locationId, 'Expense');
-    await db.delete(expenses).where(eq(expenses.id, e.id)).run();
+    // The expense goes, but what it was stays in the audit log.
+    await db.transaction(async (tx) => {
+      await tx.delete(expenses).where(eq(expenses.id, e.id)).run();
+      await audit(tx, { organizationId: req.user!.organizationId, locationId: e.locationId, actorId: req.user!.id, action: 'expense.delete', entity: 'expense', entityId: e.id, amountCents: e.amountCents, data: e });
+    });
     res.status(204).end();
   });
 

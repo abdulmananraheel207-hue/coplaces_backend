@@ -11,6 +11,7 @@ import { idParam, queryString } from '../lib/http.js';
 import { isValidDate } from '../lib/time.js';
 import { parse } from '../lib/validate.js';
 import { money } from '../lib/money.js';
+import { audit } from '../services/audit.js';
 import { addPerson, createCompanyContract, discardCompanyDraft, extendContract, refreshRent, removePerson, setContractSpaces } from '../services/companyContracts.js';
 import { monthCharges, monthlyTotal } from '../services/contractPricing.js';
 import { activateContract, endContract } from '../services/contracts.js';
@@ -284,6 +285,7 @@ export function contractsRouter(db: Db) {
       await tx.insert(depositEntries)
         .values({ locationId: c.locationId, contractId: c.id, kind: 'advance', amountCents: c.advanceCents, method: body.method, reference: body.reference, occurredAt: now, recordedById: user.id })
         .run();
+      await audit(tx, { organizationId: user.organizationId, locationId: c.locationId, actorId: user.id, action: 'advance.receive', entity: 'contract', entityId: c.id, amountCents: c.advanceCents, data: { method: body.method, reference: body.reference } });
       return tx.update(contracts).set({ advanceReceivedAt: now }).where(eq(contracts.id, c.id)).returning().get();
     });
     res.json(out);
@@ -307,11 +309,14 @@ export function contractsRouter(db: Db) {
       if (!c) throw notFound('Contract');
       assertSees(user, c.locationId, 'Contract');
       const now = new Date().toISOString();
-      const entry = (kind: 'received' | 'refunded' | 'kept', amountCents: number) =>
-        tx
+      const entry = async (kind: 'received' | 'refunded' | 'kept', amountCents: number) => {
+        await tx
           .insert(depositEntries)
           .values({ locationId: c.locationId, contractId: c.id, kind, amountCents, method: kind === 'kept' ? null : body.method, reference: body.reference, occurredAt: now, recordedById: user.id })
           .run();
+        const action = kind === 'received' ? 'deposit.receive' : kind === 'refunded' ? 'deposit.refund' : 'deposit.keep';
+        await audit(tx, { organizationId: user.organizationId, locationId: c.locationId, actorId: user.id, action, entity: 'contract', entityId: c.id, amountCents, data: { method: kind === 'kept' ? null : body.method, reference: body.reference } });
+      };
       if (body.action === 'receive') {
         if (c.depositCents <= 0) throw badRequest('This contract has no security deposit');
         if (c.depositStatus !== 'pending') throw conflict('The security deposit was already received');

@@ -21,7 +21,8 @@ import { idParam } from '../lib/http.js';
 import { tempPassword } from '../lib/passwords.js';
 import { addDays, addMonthsToDate, daysBetween, isValidDate, isValidTimezone, monthRange, todayIn } from '../lib/time.js';
 import { parse } from '../lib/validate.js';
-import { positiveMoney } from '../lib/money.js';
+import { checkPaidAt, positiveMoney } from '../lib/money.js';
+import { audit } from '../services/audit.js';
 
 type Package = typeof packages.$inferSelect;
 type Organization = typeof organizations.$inferSelect;
@@ -310,6 +311,7 @@ export function platformRouter(db: Db) {
       }),
       req.body,
     );
+    const paidAt = checkPaidAt(body.paidAt);
     const org = await loadOrg(db, idParam(req));
     const pkg = (await db.select().from(packages).where(eq(packages.id, org.packageId)).get())!;
     const t = today();
@@ -328,11 +330,12 @@ export function platformRouter(db: Db) {
           notes: body.notes,
           periodStart,
           periodEnd,
-          paidAt: body.paidAt ?? new Date().toISOString(),
+          paidAt,
           recordedById: req.user!.id,
         })
         .returning()
         .get();
+      await audit(tx, { organizationId: org.id, locationId: null, actorId: req.user!.id, action: 'platform_payment.record', entity: 'platform_payment', entityId: payment.id, amountCents: payment.amountCents, data: { method: body.method, periodStart, periodEnd, reference: body.reference } });
       const updated = await tx
         .update(organizations)
         .set({ periodEnd, status: org.status === 'trial' ? 'active' : org.status })
