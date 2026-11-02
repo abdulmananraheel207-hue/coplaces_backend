@@ -17,8 +17,8 @@ export const TZ = 'America/New_York';
  * package with no optional features and tight limits. Emails ending in @test.dev belong to A,
  * @hive.dev to B.
  */
-export async function setup() {
-  const db = await createDb(':memory:');
+export async function setup(url = ':memory:') {
+  const db = await createDb(url);
   const app = createApp(db, { webDist: '/nonexistent' });
 
   const fullPackage = await db
