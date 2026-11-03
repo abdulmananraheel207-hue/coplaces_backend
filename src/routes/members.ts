@@ -28,6 +28,7 @@ import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { DATE_RE, isValidDate, todayIn } from '../lib/time.js';
 import { finishBookingOnCheckOut } from '../services/checkin.js';
 import { amenityOwed, memberAllowance, setMemberAmenities } from '../services/amenities.js';
+import { creditResources, setCreditResources } from '../services/meetingCredits.js';
 import { deleteMember } from '../services/memberDelete.js';
 import { recordMemberMoney, settleMemberDeposit } from '../services/memberMoney.js';
 import { changePlan, freeSpacesForPlan, renewPlan, startPlanPeriod } from '../services/planBookings.js';
@@ -37,9 +38,9 @@ import { tempPassword } from '../lib/passwords.js';
 import { parse } from '../lib/validate.js';
 
 const dateStr = z.string().refine(isValidDate, 'Use YYYY-MM-DD');
-/** The amenities a member gets free each day, and the meeting room credit hours (two make an hour) they get each month. */
+/** The amenities a member gets free each day, and the credit hours (two make an hour) they get each month on chosen spaces. */
 const freeAmenities = z.array(z.object({ amenityId: z.string(), freePerDay: z.number().int().min(1).max(1000) })).max(100);
-const meetingCredits = z.number().int().min(0).max(10_000);
+const creditRooms = z.array(z.object({ resourceId: z.string(), credits: z.number().int().min(1).max(10_000) })).max(500);
 
 async function checkPlan(db: Db, planId: string | null | undefined, locationId: string) {
   if (!planId) return;
@@ -129,7 +130,7 @@ export function membersRouter(db: Db) {
         method: z.enum(PAYMENT_METHODS).default('cash'),
         reference: z.string().trim().max(100).default(''),
         amenities: freeAmenities.default([]),
-        meetingCredits: meetingCredits.default(0),
+        creditRooms: creditRooms.default([]),
       }),
       req.body,
     );
@@ -163,11 +164,11 @@ export function membersRouter(db: Db) {
           status: body.status,
           startDate: body.startDate ?? todayIn(loc.timezone),
           notes: body.notes,
-          meetingCredits: body.meetingCredits,
         })
         .returning()
         .get();
       await setMemberAmenities(tx as unknown as Db, created.id, loc.id, body.amenities);
+      await setCreditResources(tx as unknown as Db, created.id, loc.id, body.creditRooms);
       // What they paid when joining is recorded before the first invoice, so the advance comes off it.
       if (body.advanceCents || body.depositCents) await recordMemberMoney(tx as unknown as Db, req.user!, created.id, { advanceCents: body.advanceCents, depositCents: body.depositCents, method: body.method, reference: body.reference });
       // Shifts, desks and the first period of the plan are made together with the member, or not at all.
@@ -266,6 +267,7 @@ export function membersRouter(db: Db) {
         .orderBy(asc(shiftTemplates.startTime))
         .all(),
       amenities: await memberAllowance(db, member.id, today),
+      creditResources: await creditResources(db, member.id),
       amenityOwedCents: await amenityOwed(db, member.id),
       moneyEntries: await db.select().from(depositEntries).where(eq(depositEntries.memberId, member.id)).orderBy(asc(depositEntries.occurredAt)).all(),
       desks: await db.select({ id: resources.id, name: resources.name, kind: resources.kind }).from(memberDesks).innerJoin(resources, eq(resources.id, memberDesks.resourceId)).where(eq(memberDesks.memberId, member.id)).all(),
@@ -293,8 +295,8 @@ export function membersRouter(db: Db) {
           startDate: dateStr,
           endDate: dateStr.nullable(),
           notes: z.string().trim().max(2000),
-          meetingCredits,
           amenities: freeAmenities,
+          creditRooms,
         })
         .partial(),
       req.body,
@@ -307,7 +309,7 @@ export function membersRouter(db: Db) {
       if (await db.select().from(users).where(eq(users.email, body.email)).get()) throw conflict('That email is already in use');
     }
 
-    const { name, email, phone, amenities: freeList, ...memberFields } = body;
+    const { name, email, phone, amenities: freeList, creditRooms: creditList, ...memberFields } = body;
     // Cancelling someone must not leave a rent running or a security deposit unsettled.
     if (body.status === 'cancelled' && member.status !== 'cancelled') {
       const live = await db.select({ id: contracts.id }).from(contracts).where(and(eq(contracts.memberId, member.id), inArray(contracts.status, ['draft', 'active']))).get();
@@ -329,6 +331,7 @@ export function membersRouter(db: Db) {
         }
       }
       if (freeList) await setMemberAmenities(tx as unknown as Db, member.id, member.locationId, freeList);
+      if (creditList) await setCreditResources(tx as unknown as Db, member.id, member.locationId, creditList);
       const userPatch: Partial<typeof users.$inferInsert> = {};
       if (name !== undefined) userPatch.name = name;
       if (email !== undefined) userPatch.email = email;

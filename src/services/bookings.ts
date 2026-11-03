@@ -5,6 +5,7 @@ import { isPriced } from '../catalogue.js';
 import { assertLocation, isStaff, type AuthUser } from '../lib/auth.js';
 import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
 import { loadLocation } from '../lib/access.js';
+import { creditResources, freeUsage } from './meetingCredits.js';
 import { crossesMidnight, dayRange, fitsBusinessHours, localDate, localTime, minutesBetween, monthRange, shiftWindow, spanMinutes, toMinutes, todayIn } from '../lib/time.js';
 
 const LIVE = ['confirmed', 'completed'] as const;
@@ -198,19 +199,24 @@ async function planBooking(tx: Tx, req: BookingRequest, actor: AuthUser, now: Da
       priceCents = shift.priceCents;
       basis = { type: 'shift', name: shift.name };
     } else {
-      // Meeting rooms have a monthly allowance of free minutes (the plan's, plus the credit hours the owner gave this member:
-      // two credit hours are an hour). Only live bookings use it up. Everything else is charged by the hour from the first minute.
+      // Meeting rooms have a monthly allowance of free minutes: the plan's, on any meeting room, plus the credit hours the owner gave
+      // this member on this space (two credit hours are an hour). Only live bookings use it up. Everything else is charged by the
+      // hour from the first minute. A space spends its own credit hours first.
       let freeLeft = 0;
-      if (resource.kind === 'room') {
+      const credit = await creditResources(tx as unknown as Db, member.id);
+      const mine = credit.find((c) => c.id === resource.id);
+      if (resource.kind === 'room' || mine) {
         const month = monthRange(localDate(startsAt, tz).slice(0, 7), tz);
-        const used = await tx
-          .select({ startsAt: bookings.startsAt, endsAt: bookings.endsAt, billableMinutes: bookings.billableMinutes })
+        const rows = await tx
+          .select({ resourceId: bookings.resourceId, kind: resources.kind, startsAt: bookings.startsAt, endsAt: bookings.endsAt, billableMinutes: bookings.billableMinutes })
           .from(bookings)
           .innerJoin(resources, eq(resources.id, bookings.resourceId))
-          .where(and(eq(bookings.memberId, member.id), eq(resources.kind, 'room'), inArray(bookings.status, [...LIVE]), gt(bookings.startsAt, month.start), lt(bookings.startsAt, month.end)))
+          .where(and(eq(bookings.memberId, member.id), inArray(bookings.status, [...LIVE]), gt(bookings.startsAt, month.start), lt(bookings.startsAt, month.end)))
           .all();
-        const freeUsed = used.reduce((sum, b) => sum + (minutesBetween(b.startsAt, b.endsAt) - b.billableMinutes), 0);
-        freeLeft = Math.max(0, (plan?.includedMeetingMinutes ?? 0) + member.meetingCredits * 30 - freeUsed);
+        const { creditUsed, planUsed } = freeUsage(rows.map((b) => ({ resourceId: b.resourceId, kind: b.kind, free: minutesBetween(b.startsAt, b.endsAt) - b.billableMinutes })), credit);
+        const creditLeft = mine ? Math.max(0, mine.credits * 30 - (creditUsed.get(resource.id) ?? 0)) : 0;
+        const planLeft = resource.kind === 'room' ? Math.max(0, (plan?.includedMeetingMinutes ?? 0) - planUsed) : 0;
+        freeLeft = creditLeft + planLeft;
       }
       billableMinutes = duration - Math.min(duration, freeLeft);
       priceCents = Math.round((rate * billableMinutes) / 60);

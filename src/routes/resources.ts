@@ -121,27 +121,41 @@ export function resourcesRouter(db: Db) {
   });
 
   /**
-   * The Pricing tab: the owner gives spaces an hourly price (or takes it away with 0). A space with a price can be booked by the
-   * hour, by staff and by members asking; a space without one is only used through plans and contracts.
+   * The Pricing and credit hours tab: the owner gives spaces an hourly price (or takes it away with 0), and says which spaces members'
+   * credit hours can be used on. A space with a price can be booked by the hour, by staff and by members asking; a space without one
+   * is only used through plans and contracts.
    */
   r.put('/pricing', requirePermission('plans'), async (req, res) => {
     const body = parse(
       z.object({
         locationId: z.string(),
-        prices: z.array(z.object({ resourceId: z.string(), hourlyRateCents: z.number().int().min(0).max(1_000_000_000_000) })).min(1).max(1000),
+        prices: z
+          .array(z.object({ resourceId: z.string(), hourlyRateCents: z.number().int().min(0).max(1_000_000_000_000), creditsAllowed: z.boolean().optional() }))
+          .min(1)
+          .max(1000),
       }),
       req.body,
     );
     assertLocation(req.user!, body.locationId);
     const ids = [...new Set(body.prices.map((p) => p.resourceId))];
-    const found = await db.select({ id: resources.id, locationId: resources.locationId, hourlyRateCents: resources.hourlyRateCents }).from(resources).where(inArray(resources.id, ids)).all();
+    const found = await db.select({ id: resources.id, locationId: resources.locationId, hourlyRateCents: resources.hourlyRateCents, creditsAllowed: resources.creditsAllowed }).from(resources).where(inArray(resources.id, ids)).all();
     if (found.length !== ids.length || found.some((f) => f.locationId !== body.locationId)) throw notFound('Space');
-    const changed = body.prices.filter((p) => found.find((f) => f.id === p.resourceId)!.hourlyRateCents !== p.hourlyRateCents);
+    // Credit hours are allowed per space, whether or not it has an hourly price.
+    const wanted = body.prices.map((p) => ({ ...p, creditsAllowed: p.creditsAllowed ?? found.find((f) => f.id === p.resourceId)!.creditsAllowed }));
+    const changed = wanted.filter((p) => {
+      const f = found.find((x) => x.id === p.resourceId)!;
+      return f.hourlyRateCents !== p.hourlyRateCents || f.creditsAllowed !== p.creditsAllowed;
+    });
     await db.transaction(async (tx) => {
-      // spaces getting the same price go in one statement
-      const byPrice = new Map<number, string[]>();
-      for (const c of changed) byPrice.set(c.hourlyRateCents, [...(byPrice.get(c.hourlyRateCents) ?? []), c.resourceId]);
-      for (const [price, list] of byPrice) await tx.update(resources).set({ hourlyRateCents: price }).where(inArray(resources.id, list)).run();
+      // spaces getting the same price and credit setting go in one statement
+      const groups = new Map<string, { hourlyRateCents: number; creditsAllowed: boolean; ids: string[] }>();
+      for (const c of changed) {
+        const key = `${c.hourlyRateCents}:${c.creditsAllowed}`;
+        const g = groups.get(key) ?? { hourlyRateCents: c.hourlyRateCents, creditsAllowed: c.creditsAllowed, ids: [] };
+        g.ids.push(c.resourceId);
+        groups.set(key, g);
+      }
+      for (const g of groups.values()) await tx.update(resources).set({ hourlyRateCents: g.hourlyRateCents, creditsAllowed: g.creditsAllowed }).where(inArray(resources.id, g.ids)).run();
     });
     res.json({ changed: changed.length });
   });
