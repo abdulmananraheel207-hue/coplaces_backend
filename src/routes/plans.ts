@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { and, asc, eq, ne } from 'drizzle-orm';
+import { and, asc, eq, isNotNull, ne } from 'drizzle-orm';
 import { z } from 'zod';
 import type { Db } from '../db/client.js';
 import { PLAN_INTERVALS, members, plans, shiftTemplates } from '../db/schema.js';
@@ -53,8 +53,9 @@ export function plansRouter(db: Db) {
     const plan = await db.select().from(plans).where(eq(plans.id, idParam(req))).get();
     if (!plan) throw notFound('Plan');
     assertLocation(req.user!, plan.locationId);
-    // Members on it have bookings and invoices made by it. Move them to another plan (which re-bills them) before it goes.
-    const on = await db.select({ id: members.id }).from(members).where(and(eq(members.planId, plan.id), ne(members.status, 'cancelled'))).all();
+    // Members in a period of it have bookings and an invoice made by it. Move them to another plan (which re-books and re-bills them)
+    // before it goes. Members on a plan from before shifts simply stop being billed its price.
+    const on = await db.select({ id: members.id }).from(members).where(and(eq(members.planId, plan.id), ne(members.status, 'cancelled'), isNotNull(members.planStart))).all();
     if (on.length) throw conflict(`${on.length} member${on.length === 1 ? ' is' : 's are'} on this plan. Move them to another plan first.`);
     await db.transaction(async (tx) => {
       await tx.update(members).set({ planId: null }).where(eq(members.planId, plan.id)).run();
