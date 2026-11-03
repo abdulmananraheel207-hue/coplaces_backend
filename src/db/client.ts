@@ -16,6 +16,9 @@ const migrationsFolder = fileURLToPath(new URL('../../drizzle', import.meta.url)
 export async function createDb(url: string, authToken?: string, opts: { migrate?: boolean } = {}) {
   if (url.startsWith('file:')) mkdirSync(dirname(fileURLToPath(new URL(url, `file:///${process.cwd()}/`))), { recursive: true });
   const client = createClient({ url, authToken });
+  // Where migrations already ran (a Vercel function: the deploy migrated at build time) there is nothing to check, and a cold start
+  // should not pay two round trips to Turso before it answers anyone.
+  if (opts.migrate === false) return drizzle(client, { schema });
   // libsql enforces foreign keys on every connection, local or remote, so there is no pragma to set.
   const hasTable = async (name: string) =>
     (await client.execute({ sql: "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", args: [name] })).rows.length > 0;
@@ -42,7 +45,7 @@ export async function createDb(url: string, authToken?: string, opts: { migrate?
     );
   }
   const db = drizzle(client, { schema });
-  if (opts.migrate !== false) await migrate(db, { migrationsFolder });
+  await migrate(db, { migrationsFolder });
   return db;
 }
 

@@ -135,18 +135,23 @@ export function contractsRouter(db: Db) {
     if (!start || !isValidDate(start) || (end && !isValidDate(end))) throw badRequest('Give the dates as YYYY-MM-DD');
     const loc = await loadLocation(db, locationId);
     const kinds = ['room', 'corporate_room', 'hot_desk', 'dedicated_desk', 'office'];
-    const rows = (await db.select().from(resources).where(eq(resources.locationId, locationId)).all()).filter((x) => kinds.includes(x.kind) && x.status === 'available');
-    const taken = await db
-      .select({ resourceId: resourceAssignments.resourceId })
-      .from(resourceAssignments)
-      .where(and(or(isNull(resourceAssignments.endDate), gte(resourceAssignments.endDate, start)), end ? lte(resourceAssignments.startDate, end) : undefined))
-      .all();
     const from = zonedToUtc(start, '00:00', loc.timezone).toISOString();
-    const booked = await db
-      .select({ resourceId: bookings.resourceId })
-      .from(bookings)
-      .where(and(inArray(bookings.status, ['confirmed']), gte(bookings.endsAt, from), end ? lte(bookings.startsAt, zonedToUtc(addDays(end, 1), '00:00', loc.timezone).toISOString()) : undefined))
-      .all();
+    // Three independent reads, each limited to this location (they used to read every tenant's assignments and bookings).
+    const [spaces, taken, booked] = await Promise.all([
+      db.select().from(resources).where(eq(resources.locationId, locationId)).all(),
+      db
+        .select({ resourceId: resourceAssignments.resourceId })
+        .from(resourceAssignments)
+        .innerJoin(resources, eq(resources.id, resourceAssignments.resourceId))
+        .where(and(eq(resources.locationId, locationId), or(isNull(resourceAssignments.endDate), gte(resourceAssignments.endDate, start)), end ? lte(resourceAssignments.startDate, end) : undefined))
+        .all(),
+      db
+        .select({ resourceId: bookings.resourceId })
+        .from(bookings)
+        .where(and(eq(bookings.locationId, locationId), inArray(bookings.status, ['confirmed']), gte(bookings.endsAt, from), end ? lte(bookings.startsAt, zonedToUtc(addDays(end, 1), '00:00', loc.timezone).toISOString()) : undefined))
+        .all(),
+    ]);
+    const rows = spaces.filter((x) => kinds.includes(x.kind) && x.status === 'available');
     res.json(
       rows.map((x) => {
         const busy = taken.some((t) => t.resourceId === x.id) ? 'Already rented in that time' : booked.some((b) => b.resourceId === x.id) ? 'Has bookings in that time' : null;

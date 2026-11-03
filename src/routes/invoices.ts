@@ -62,8 +62,12 @@ export function invoicesRouter(db: Db) {
       assertSees(user, inv.locationId, 'Invoice');
     } else if (user.memberId !== inv.memberId) throw notFound('Invoice');
 
-    const loc = await loadLocation(db, inv.locationId);
-    const { member, user: memberUser } = await loadMember(db, inv.memberId);
+    const [loc, { member, user: memberUser }, items, paid] = await Promise.all([
+      loadLocation(db, inv.locationId),
+      loadMember(db, inv.memberId),
+      db.select().from(invoiceItems).where(eq(invoiceItems.invoiceId, inv.id)).all(),
+      db.select().from(payments).where(eq(payments.invoiceId, inv.id)).orderBy(asc(payments.paidAt)).all(),
+    ]);
     res.json({
       ...withBalance(inv, todayIn(loc.timezone)),
       memberName: memberUser.name,
@@ -72,8 +76,8 @@ export function invoicesRouter(db: Db) {
       currency: loc.currency,
       timezone: loc.timezone,
       location: { name: loc.name, address: loc.address },
-      items: await db.select().from(invoiceItems).where(eq(invoiceItems.invoiceId, inv.id)).all(),
-      payments: await db.select().from(payments).where(eq(payments.invoiceId, inv.id)).orderBy(asc(payments.paidAt)).all(),
+      items,
+      payments: paid,
     });
   });
 

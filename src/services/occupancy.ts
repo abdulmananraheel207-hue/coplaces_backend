@@ -26,37 +26,34 @@ export async function occupancy(db: Db, locationId: string, from: string, to: st
   const loc = await loadLocation(db, locationId);
   const span = Math.min(daysBetween(from, to) + 1, 366);
   const days = Array.from({ length: span }, (_, i) => addDays(from, i));
-  // The same test as closedReason, with the period's holidays fetched in one query rather than one per day.
-  const holidays = new Set(
-    (await db
+  const rangeStart = zonedToUtc(from, '00:00', loc.timezone).toISOString();
+  const rangeEnd = zonedToUtc(addDays(from, span), '00:00', loc.timezone).toISOString();
+  // The reads are independent, so they go together (each is a round trip on Turso).
+  const [holidayRows, allSpaces, live, held] = await Promise.all([
+    // The same test as closedReason, with the period's holidays fetched in one query rather than one per day.
+    db
       .select({ date: locationHolidays.date })
       .from(locationHolidays)
       .where(and(eq(locationHolidays.locationId, locationId), gte(locationHolidays.date, from), lte(locationHolidays.date, addDays(from, span - 1))))
-      .all())
-      .map((h) => h.date),
-  );
+      .all(),
+    db.select().from(resources).where(eq(resources.locationId, locationId)).all(),
+    db
+      .select()
+      .from(bookings)
+      .where(and(eq(bookings.locationId, locationId), inArray(bookings.status, ['confirmed', 'completed']), gte(bookings.startsAt, rangeStart), lt(bookings.startsAt, rangeEnd)))
+      .all(),
+    // Only this location's assignments (through its spaces), not every tenant's.
+    db
+      .select({ resourceId: resourceAssignments.resourceId, startDate: resourceAssignments.startDate, endDate: resourceAssignments.endDate })
+      .from(resourceAssignments)
+      .innerJoin(resources, eq(resources.id, resourceAssignments.resourceId))
+      .where(and(eq(resources.locationId, locationId), lte(resourceAssignments.startDate, addDays(from, span - 1)), or(isNull(resourceAssignments.endDate), gte(resourceAssignments.endDate, from))))
+      .all(),
+  ]);
+  const holidays = new Set(holidayRows.map((h) => h.date));
   const closedWeekdays = loc.closedWeekdays.split(',');
   const openDays = days.filter((d) => !holidays.has(d) && !closedWeekdays.includes(String(weekdayOf(d))));
-
-  const spaces = (await db
-    .select()
-    .from(resources)
-    .where(and(eq(resources.locationId, locationId)))
-    .all())
-    .filter((r) => r.status !== 'retired');
-
-  const rangeStart = zonedToUtc(from, '00:00', loc.timezone).toISOString();
-  const rangeEnd = zonedToUtc(addDays(from, span), '00:00', loc.timezone).toISOString();
-  const live = await db
-    .select()
-    .from(bookings)
-    .where(and(eq(bookings.locationId, locationId), inArray(bookings.status, ['confirmed', 'completed']), gte(bookings.startsAt, rangeStart), lt(bookings.startsAt, rangeEnd)))
-    .all();
-  const held = await db
-    .select()
-    .from(resourceAssignments)
-    .where(and(lte(resourceAssignments.startDate, addDays(from, span - 1)), or(isNull(resourceAssignments.endDate), gte(resourceAssignments.endDate, from))))
-    .all();
+  const spaces = allSpaces.filter((r) => r.status !== 'retired');
 
   const items: OccupancyItem[] = spaces.map((r) => {
     const base = { resourceId: r.id, name: r.name, kind: r.kind, floor: r.floor };

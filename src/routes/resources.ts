@@ -62,37 +62,28 @@ export function resourcesRouter(db: Db) {
     const loc = await loadLocation(db, locationId);
     const today = todayIn(loc.timezone);
 
-    const rows = (await db
-      .select()
-      .from(resources)
-      .where(eq(resources.locationId, locationId))
-      .orderBy(asc(resources.kind))
-      .all())
-      .filter((x) => !kind || x.kind === kind)
-      .sort((a, b) => a.kind.localeCompare(b.kind) || byName(a.name, b.name));
-
+    // The reads are independent (each is a round trip on Turso), and all are limited to this location.
+    const [all, photoRows, active] = await Promise.all([
+      db.select().from(resources).where(eq(resources.locationId, locationId)).all(),
+      db
+        .select({ id: resourcePhotos.id, resourceId: resourcePhotos.resourceId })
+        .from(resourcePhotos)
+        .innerJoin(resources, eq(resources.id, resourcePhotos.resourceId))
+        .where(eq(resources.locationId, locationId))
+        .orderBy(asc(resourcePhotos.createdAt))
+        .all(),
+      db
+        .select({ a: resourceAssignments, name: users.name, company: members.company })
+        .from(resourceAssignments)
+        .innerJoin(resources, eq(resources.id, resourceAssignments.resourceId))
+        .innerJoin(members, eq(members.id, resourceAssignments.memberId))
+        .innerJoin(users, eq(users.id, members.userId))
+        .where(and(eq(resources.locationId, locationId), lte(resourceAssignments.startDate, today), or(isNull(resourceAssignments.endDate), gte(resourceAssignments.endDate, today))))
+        .all(),
+    ]);
+    const rows = all.filter((x) => !kind || x.kind === kind).sort((a, b) => a.kind.localeCompare(b.kind) || byName(a.name, b.name));
     // Members only see who occupies a space if they are staff.
     const staff = req.user!.role !== 'member';
-    const photoRows = rows.length
-      ? await db
-          .select({ id: resourcePhotos.id, resourceId: resourcePhotos.resourceId })
-          .from(resourcePhotos)
-          .where(inArray(resourcePhotos.resourceId, rows.map((x) => x.id)))
-          .orderBy(asc(resourcePhotos.createdAt))
-          .all()
-      : [];
-    const active = await db
-      .select({ a: resourceAssignments, name: users.name, company: members.company })
-      .from(resourceAssignments)
-      .innerJoin(members, eq(members.id, resourceAssignments.memberId))
-      .innerJoin(users, eq(users.id, members.userId))
-      .where(
-        and(
-          lte(resourceAssignments.startDate, today),
-          or(isNull(resourceAssignments.endDate), gte(resourceAssignments.endDate, today)),
-        ),
-      )
-      .all();
 
     res.json(
       rows.map((x) => {

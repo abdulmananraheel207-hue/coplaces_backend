@@ -68,15 +68,20 @@ export function shiftsRouter(db: Db) {
   // (and ones that belong to no plan); staff booking for a member pass that member's id, and staff without one see every shift.
   r.get('/', async (req, res) => {
     const locationId = requireLocationId(req);
-    await loadLocation(db, locationId);
-    let rows = await db.select().from(shiftTemplates).where(eq(shiftTemplates.locationId, locationId)).orderBy(asc(shiftTemplates.startTime), asc(shiftTemplates.name)).all();
     const memberId = req.user!.role === 'member' ? req.user!.memberId : queryString(req, 'memberId');
+    // The shifts, their spaces and the member asked about, all at once (each read is a round trip on Turso).
+    const [, all, listed, m] = await Promise.all([
+      loadLocation(db, locationId),
+      db.select().from(shiftTemplates).where(eq(shiftTemplates.locationId, locationId)).orderBy(asc(shiftTemplates.startTime), asc(shiftTemplates.name)).all(),
+      db.select({ shiftId: shiftSpaces.shiftId, resourceId: shiftSpaces.resourceId }).from(shiftSpaces).innerJoin(shiftTemplates, eq(shiftTemplates.id, shiftSpaces.shiftId)).where(eq(shiftTemplates.locationId, locationId)).all(),
+      memberId ? db.select({ planId: members.planId, locationId: members.locationId }).from(members).where(eq(members.id, memberId)).get() : Promise.resolve(undefined),
+    ]);
+    let rows = all;
     if (memberId) {
-      const m = await db.select({ planId: members.planId, locationId: members.locationId }).from(members).where(eq(members.id, memberId)).get();
       if (!m || m.locationId !== locationId) throw notFound('Member');
       rows = rows.filter((x) => !x.planId || x.planId === m.planId);
     }
-    res.json(await shape(rows));
+    res.json(rows.map((x) => ({ ...x, spaceIds: listed.filter((s) => s.shiftId === x.id).map((s) => s.resourceId) })));
   });
 
   r.post('/', requirePermission('plans'), async (req, res) => {

@@ -18,12 +18,10 @@ const EARLY = 30;
  * Done whenever people are checked in or the "in the building" list is read, so nothing stays open overnight.
  */
 export async function closeStaleVisits(db: Db, locationId: string, now = new Date()) {
-  const loc = await loadLocation(db, locationId);
-  const open = await db
-    .select()
-    .from(attendance)
-    .where(and(eq(attendance.locationId, locationId), isNull(attendance.checkOutAt)))
-    .all();
+  const [loc, open] = await Promise.all([
+    loadLocation(db, locationId),
+    db.select().from(attendance).where(and(eq(attendance.locationId, locationId), isNull(attendance.checkOutAt))).all(),
+  ]);
   const nowIso = now.toISOString();
   // The business day a visit began in ends at the closing time, which for a business open past midnight is the next morning.
   const closingOf = (checkInAt: string) => {
@@ -245,31 +243,36 @@ export async function finishBookingOnCheckOut(db: Db, row: { memberId: string; r
  * Members still in the building after the time they were meant to leave: they are checked in, their booking or shift has ended,
  * and nothing they booked is running now or about to start. The front desk sees these, and so does the member.
  */
-export async function overstayers(db: Db, locationId: string, memberId?: string, now = new Date()) {
-  const loc = await loadLocation(db, locationId);
-  const open = await db
-    .select({ a: attendance, name: users.name })
-    .from(attendance)
-    .innerJoin(members, eq(members.id, attendance.memberId))
-    .innerJoin(users, eq(users.id, members.userId))
-    .where(and(eq(attendance.locationId, locationId), isNull(attendance.checkOutAt), memberId ? eq(attendance.memberId, memberId) : undefined))
-    .all();
+export async function overstayers(db: Db, locationId: string, memberId?: string, now = new Date(), known?: Awaited<ReturnType<typeof loadLocation>>) {
+  const [loc, open] = await Promise.all([
+    known ?? loadLocation(db, locationId),
+    db
+      .select({ a: attendance, name: users.name })
+      .from(attendance)
+      .innerJoin(members, eq(members.id, attendance.memberId))
+      .innerJoin(users, eq(users.id, members.userId))
+      .where(and(eq(attendance.locationId, locationId), isNull(attendance.checkOutAt), memberId ? eq(attendance.memberId, memberId) : undefined))
+      .all(),
+  ]);
   if (!open.length) return [];
   const nowMs = now.getTime();
   const nowIso = now.toISOString();
-  const rows = await db
-    .select({ b: bookings, kind: resources.kind, name: resources.name })
-    .from(bookings)
-    .innerJoin(resources, eq(resources.id, bookings.resourceId))
-    .where(and(inArray(bookings.memberId, open.map((o) => o.a.memberId)), inArray(bookings.status, [...LIVE]), lt(bookings.startsAt, new Date(nowMs + 24 * 3_600_000).toISOString()), gte(bookings.endsAt, new Date(nowMs - 24 * 3_600_000).toISOString())))
-    .all();
-  const rented = new Set(
-    (await db
+  const who = open.map((o) => o.a.memberId);
+  const businessDay = businessDateOf(now, loc.timezone, loc.openTime, loc.closeTime);
+  const [rows, rentedRows] = await Promise.all([
+    db
+      .select({ b: bookings, kind: resources.kind, name: resources.name })
+      .from(bookings)
+      .innerJoin(resources, eq(resources.id, bookings.resourceId))
+      .where(and(inArray(bookings.memberId, who), inArray(bookings.status, [...LIVE]), lt(bookings.startsAt, new Date(nowMs + 24 * 3_600_000).toISOString()), gte(bookings.endsAt, new Date(nowMs - 24 * 3_600_000).toISOString())))
+      .all(),
+    db
       .select({ memberId: resourceAssignments.memberId })
       .from(resourceAssignments)
-      .where(and(inArray(resourceAssignments.memberId, open.map((o) => o.a.memberId)), lte(resourceAssignments.startDate, businessDateOf(now, loc.timezone, loc.openTime, loc.closeTime)), or(isNull(resourceAssignments.endDate), gte(resourceAssignments.endDate, businessDateOf(now, loc.timezone, loc.openTime, loc.closeTime)))))
-      .all()).map((r) => r.memberId),
-  );
+      .where(and(inArray(resourceAssignments.memberId, who), lte(resourceAssignments.startDate, businessDay), or(isNull(resourceAssignments.endDate), gte(resourceAssignments.endDate, businessDay))))
+      .all(),
+  ]);
+  const rented = new Set(rentedRows.map((r) => r.memberId));
   const out = [];
   for (const { a, name } of open) {
     if (rented.has(a.memberId)) continue; // a space of their own can be used at any hour

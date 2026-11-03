@@ -96,9 +96,17 @@ export async function loadOrgContext(db: Db, organizationId: string): Promise<Or
 export type AuthResult = { user: AuthUser } | { blocked: string };
 
 export async function resolveAuth(db: Db, userId: string): Promise<AuthResult> {
-  // The user, their organization and its package in one statement: every request pays for each one the database is asked.
+  // Everything a request needs to know about who is asking, in ONE statement: the user, their organization and package, the
+  // locations they may act in and, for a member, their membership. On Turso every statement is a round trip, and every request pays it.
   const found = await db
-    .select({ u: users, org: organizations, pkg: packages })
+    .select({
+      u: users,
+      org: organizations,
+      pkg: packages,
+      orgLocations: sql<string | null>`(select group_concat(l.id) from locations l where l.organization_id = ${users.organizationId})`,
+      ownLocations: sql<string | null>`(select group_concat(ul.location_id) from user_locations ul join locations l on l.id = ul.location_id where ul.user_id = ${users.id} and l.organization_id = ${users.organizationId})`,
+      membership: sql<string | null>`(select m.id || '|' || m.location_id from members m where m.user_id = ${users.id})`,
+    })
     .from(users)
     .leftJoin(organizations, eq(organizations.id, users.organizationId))
     .leftJoin(packages, eq(packages.id, organizations.packageId))
@@ -117,31 +125,21 @@ export async function resolveAuth(db: Db, userId: string): Promise<AuthResult> {
     return { blocked: `The subscription for ${org.name} is ${org.status}. Please contact Coplaces support.` };
   }
 
+  const list = (s: string | null) => (s ? s.split(',') : []);
   let locationIds: string[];
   let memberId: string | null = null;
   if (u.role === 'owner') {
-    locationIds = (await db
-      .select({ id: locations.id })
-      .from(locations)
-      .where(eq(locations.organizationId, org.id))
-      .all())
-      .map((l) => l.id);
+    locationIds = list(found.orgLocations);
   } else if (u.role === 'member') {
     if (!org.features.includes('member_portal')) {
       return { blocked: `${org.name} has not turned on the member portal. Please ask the front desk.` };
     }
-    const m = await db.select().from(members).where(eq(members.userId, u.id)).get();
-    if (!m) return { blocked: 'Account unavailable' };
-    memberId = m.id;
-    locationIds = [m.locationId];
+    if (!found.membership) return { blocked: 'Account unavailable' };
+    const [id, locationId] = found.membership.split('|') as [string, string];
+    memberId = id;
+    locationIds = [locationId];
   } else {
-    locationIds = (await db
-      .select({ id: userLocations.locationId })
-      .from(userLocations)
-      .innerJoin(locations, eq(locations.id, userLocations.locationId))
-      .where(and(eq(userLocations.userId, u.id), eq(locations.organizationId, org.id)))
-      .all())
-      .map((l) => l.id);
+    locationIds = list(found.ownLocations);
   }
   return { user: { id: u.id, email: u.email, name: u.name, role: u.role, permissions: resolvePermissions(u.role, u.permissions), locationIds, memberId, organizationId: org.id, org } };
 }

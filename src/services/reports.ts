@@ -36,76 +36,51 @@ export async function dashboard(db: Db, locationId: string, includeFinance: bool
   const month = monthRange(today.slice(0, 7), tz);
   const nowIso = now.toISOString();
 
-  const activeMembers = (await db
-    .select({ n: count })
-    .from(members)
-    .where(and(eq(members.locationId, locationId), eq(members.status, 'active')))
-    .get())!.n;
-  const checkedInNow = (await db
-    .select({ n: count })
-    .from(attendance)
-    .where(and(eq(attendance.locationId, locationId), isNull(attendance.checkOutAt)))
-    .get())!.n;
-
-  const visitorsToday = await db
-    .select({ status: visitors.status, n: count })
-    .from(visitors)
-    .where(and(eq(visitors.locationId, locationId), gte(visitors.expectedAt, day.start), lt(visitors.expectedAt, day.end)))
-    .groupBy(visitors.status)
-    .all();
+  // Every read below is independent of the others, so they go to the database together: on Turso each one is a round trip, and
+  // waiting for them one after another is what made this page slow.
+  const [activeRow, checkedInRow, visitorsToday, insideRow, totals, liveToday, assigned, overstaying, finance] = await Promise.all([
+    db.select({ n: count }).from(members).where(and(eq(members.locationId, locationId), eq(members.status, 'active'))).get(),
+    db.select({ n: count }).from(attendance).where(and(eq(attendance.locationId, locationId), isNull(attendance.checkOutAt))).get(),
+    db
+      .select({ status: visitors.status, n: count })
+      .from(visitors)
+      .where(and(eq(visitors.locationId, locationId), gte(visitors.expectedAt, day.start), lt(visitors.expectedAt, day.end)))
+      .groupBy(visitors.status)
+      .all(),
+    db.select({ n: count }).from(visitors).where(and(eq(visitors.locationId, locationId), eq(visitors.status, 'checked_in'))).get(),
+    db
+      .select({ kind: resources.kind, n: count })
+      .from(resources)
+      .where(and(eq(resources.locationId, locationId), eq(resources.status, 'available')))
+      .groupBy(resources.kind)
+      .all(),
+    db
+      .select({ resourceId: bookings.resourceId, kind: resources.kind, startsAt: bookings.startsAt, endsAt: bookings.endsAt })
+      .from(bookings)
+      .innerJoin(resources, eq(resources.id, bookings.resourceId))
+      .where(and(eq(bookings.locationId, locationId), inArray(bookings.status, ['confirmed', 'completed']), lt(bookings.startsAt, day.end), gt(bookings.endsAt, day.start)))
+      .all(),
+    db
+      .select({ resourceId: resourceAssignments.resourceId, kind: resources.kind })
+      .from(resourceAssignments)
+      .innerJoin(resources, eq(resources.id, resourceAssignments.resourceId))
+      .where(and(eq(resources.locationId, locationId), lte(resourceAssignments.startDate, today), or(isNull(resourceAssignments.endDate), gte(resourceAssignments.endDate, today))))
+      .all(),
+    overstayers(db, locationId, undefined, now, loc),
+    includeFinance ? financeToday(db, locationId, today, month) : Promise.resolve(null),
+  ]);
   const vCount = (s: string) => visitorsToday.find((v) => v.status === s)?.n ?? 0;
-  const visitorsInside = (await db
-    .select({ n: count })
-    .from(visitors)
-    .where(and(eq(visitors.locationId, locationId), eq(visitors.status, 'checked_in')))
-    .get())!.n;
-
-  const totals = await db
-    .select({ kind: resources.kind, n: count })
-    .from(resources)
-    .where(and(eq(resources.locationId, locationId), eq(resources.status, 'available')))
-    .groupBy(resources.kind)
-    .all();
   const total = (k: string) => totals.find((t) => t.kind === k)?.n ?? 0;
-
-  const liveToday = await db
-    .select({ resourceId: bookings.resourceId, kind: resources.kind, startsAt: bookings.startsAt, endsAt: bookings.endsAt })
-    .from(bookings)
-    .innerJoin(resources, eq(resources.id, bookings.resourceId))
-    .where(
-      and(
-        eq(bookings.locationId, locationId),
-        inArray(bookings.status, ['confirmed', 'completed']),
-        lt(bookings.startsAt, day.end),
-        gt(bookings.endsAt, day.start),
-      ),
-    )
-    .all();
-  const roomsInUseNow = new Set(
-    liveToday.filter((b) => isHourly(b.kind) && b.startsAt <= nowIso && b.endsAt > nowIso).map((b) => b.resourceId),
-  ).size;
+  const roomsInUseNow = new Set(liveToday.filter((b) => isHourly(b.kind) && b.startsAt <= nowIso && b.endsAt > nowIso).map((b) => b.resourceId)).size;
   const hotDesksBooked = new Set(liveToday.filter((b) => b.kind === 'hot_desk').map((b) => b.resourceId)).size;
-
-  const assigned = await db
-    .select({ resourceId: resourceAssignments.resourceId, kind: resources.kind })
-    .from(resourceAssignments)
-    .innerJoin(resources, eq(resources.id, resourceAssignments.resourceId))
-    .where(
-      and(
-        eq(resources.locationId, locationId),
-        lte(resourceAssignments.startDate, today),
-        or(isNull(resourceAssignments.endDate), gte(resourceAssignments.endDate, today)),
-      ),
-    )
-    .all();
   const assignedOf = (k: string) => new Set(assigned.filter((a) => a.kind === k).map((a) => a.resourceId)).size;
 
   const ops = {
-    activeMembers,
-    checkedInNow,
+    activeMembers: activeRow!.n,
+    checkedInNow: checkedInRow!.n,
     visitorsExpectedToday: vCount('expected'),
     visitorsToday: vCount('expected') + vCount('checked_in') + vCount('checked_out'),
-    visitorsInside,
+    visitorsInside: insideRow!.n,
     bookingsToday: liveToday.length,
     // Corporate rooms count with the rooms: both are booked by the hour.
     rooms: { total: total('room') + total('corporate_room'), inUseNow: roomsInUseNow },
@@ -113,33 +88,35 @@ export async function dashboard(db: Db, locationId: string, includeFinance: bool
     dedicatedDesks: { total: total('dedicated_desk'), assigned: assignedOf('dedicated_desk') },
     offices: { total: total('office'), assigned: assignedOf('office') },
     storage: { total: total('storage'), assigned: assignedOf('storage') },
-    overstaying: await overstayers(db, locationId, undefined, now),
+    overstaying,
   };
 
-  let finance = null;
-  if (includeFinance) {
-    const books = await loadBooks(db, locationId);
-    const w = { start: month.start, end: month.end };
-    const thisMonth = { from: month.firstDay, to: addDays(month.nextFirstDay, -1) };
-    const spent = (await db
+  return { today, currency: loc.currency, ops, finance };
+}
+
+/** The Today page's finance block: this month's money in, billed, tax and costs, what is owed now, and MRR. Reads run together. */
+async function financeToday(db: Db, locationId: string, today: string, month: ReturnType<typeof monthRange>) {
+  const [books, spentRow, mrrCents] = await Promise.all([
+    loadBooks(db, locationId),
+    db
       .select({ v: sumOf(expenses.amountCents) })
       .from(expenses)
       .where(and(eq(expenses.locationId, locationId), gte(expenses.incurredOn, month.firstDay), lt(expenses.incurredOn, month.nextFirstDay)))
-      .get())!.v;
-    const open = books.invoices.filter((i) => i.status === 'open' && i.dueDate < today);
-    finance = {
-      mrrCents: await monthlyRecurring(db, locationId, today),
-      collectedThisMonthCents: core.collectedCents(books, w),
-      invoicedThisMonthCents: core.billedCents(books.invoices, books.lines, thisMonth),
-      taxCollectedThisMonthCents: core.taxCollectedCents(books, w),
-      expensesThisMonthCents: spent,
-      outstandingCents: core.outstandingCents(books.invoices),
-      overdueCents: core.overdueCents(books.invoices, today),
-      overdueCount: open.length,
-    };
-  }
-
-  return { today, currency: loc.currency, ops, finance };
+      .get(),
+    monthlyRecurring(db, locationId, today),
+  ]);
+  const w = { start: month.start, end: month.end };
+  const thisMonth = { from: month.firstDay, to: addDays(month.nextFirstDay, -1) };
+  return {
+    mrrCents,
+    collectedThisMonthCents: core.collectedCents(books, w),
+    invoicedThisMonthCents: core.billedCents(books.invoices, books.lines, thisMonth),
+    taxCollectedThisMonthCents: core.taxCollectedCents(books, w),
+    expensesThisMonthCents: spentRow!.v,
+    outstandingCents: core.outstandingCents(books.invoices),
+    overdueCents: core.overdueCents(books.invoices, today),
+    overdueCount: books.invoices.filter((i) => i.status === 'open' && i.dueDate < today).length,
+  };
 }
 
 /**
@@ -147,24 +124,25 @@ export async function dashboard(db: Db, locationId: string, includeFinance: bool
  * before shifts its own price) while their plan period has not lapsed, and the monthly rent of every contract running today.
  */
 async function monthlyRecurring(db: Db, locationId: string, today: string) {
-  const onShifts = await db
-    .select({ memberId: memberShifts.memberId, price: shiftTemplates.priceCents, planEnd: members.planEnd })
-    .from(memberShifts)
-    .innerJoin(shiftTemplates, eq(shiftTemplates.id, memberShifts.shiftId))
-    .innerJoin(members, eq(members.id, memberShifts.memberId))
-    .innerJoin(plans, eq(plans.id, members.planId))
-    .where(and(eq(members.locationId, locationId), eq(members.status, 'active'), eq(plans.interval, 'month')))
-    .all();
+  const [onShifts, legacy, running] = await Promise.all([
+    db
+      .select({ memberId: memberShifts.memberId, price: shiftTemplates.priceCents, planEnd: members.planEnd })
+      .from(memberShifts)
+      .innerJoin(shiftTemplates, eq(shiftTemplates.id, memberShifts.shiftId))
+      .innerJoin(members, eq(members.id, memberShifts.memberId))
+      .innerJoin(plans, eq(plans.id, members.planId))
+      .where(and(eq(members.locationId, locationId), eq(members.status, 'active'), eq(plans.interval, 'month')))
+      .all(),
+    db
+      .select({ id: members.id, price: plans.priceCents })
+      .from(members)
+      .innerJoin(plans, eq(plans.id, members.planId))
+      .where(and(eq(members.locationId, locationId), eq(members.status, 'active'), eq(plans.interval, 'month'), isNull(members.planStart)))
+      .all(),
+    db.select().from(contracts).where(and(eq(contracts.locationId, locationId), eq(contracts.status, 'active'))).all(),
+  ]);
   const withShifts = new Set(onShifts.map((x) => x.memberId));
-  const legacy = await db
-    .select({ id: members.id, price: plans.priceCents })
-    .from(members)
-    .innerJoin(plans, eq(plans.id, members.planId))
-    .where(and(eq(members.locationId, locationId), eq(members.status, 'active'), eq(plans.interval, 'month'), isNull(members.planStart)))
-    .all();
-  const rent = (await db.select().from(contracts).where(and(eq(contracts.locationId, locationId), eq(contracts.status, 'active'))).all()).filter(
-    (c) => c.startDate <= today && (!c.endDate || c.endDate >= today),
-  );
+  const rent = running.filter((c) => c.startDate <= today && (!c.endDate || c.endDate >= today));
   return (
     onShifts.filter((x) => !x.planEnd || x.planEnd >= today).reduce((s, x) => s + (x.price ?? 0), 0) +
     legacy.filter((x) => !withShifts.has(x.id)).reduce((s, x) => s + x.price, 0) +
@@ -197,18 +175,42 @@ export async function financeReport(db: Db, p: { locationId: string; from: strin
   const tz = loc.timezone;
   const window = (from: string, to: string) => ({ start: zonedToUtc(from, '00:00', tz).toISOString(), end: zonedToUtc(addDays(to, 1), '00:00', tz).toISOString() });
   const w = window(p.from, p.to);
-  const books = await loadBooks(db, p.locationId);
+  // The period just before, as long as this one, on the same definitions.
+  const span = daysBetween(p.from, p.to) + 1;
+  const prevTo = addDays(p.from, -1);
+  const prevFrom = addDays(p.from, -span);
+  // Every read at once: on Turso each is a round trip.
+  const [books, spend, prevExpenseRow, depositMoves, amenity, unapplied] = await Promise.all([
+    loadBooks(db, p.locationId),
+    db
+      .select({ amountCents: expenses.amountCents, category: expenses.category, incurredOn: expenses.incurredOn })
+      .from(expenses)
+      .where(and(eq(expenses.locationId, p.locationId), gte(expenses.incurredOn, p.from), lte(expenses.incurredOn, p.to)))
+      .all(),
+    db
+      .select({ v: sumOf(expenses.amountCents) })
+      .from(expenses)
+      .where(and(eq(expenses.locationId, p.locationId), gte(expenses.incurredOn, prevFrom), lte(expenses.incurredOn, prevTo)))
+      .get(),
+    db
+      .select({ e: depositEntries, memberName: users.name, resourceName: resources.name })
+      .from(depositEntries)
+      .leftJoin(contracts, eq(contracts.id, depositEntries.contractId))
+      .innerJoin(members, eq(members.id, sql`coalesce(${depositEntries.memberId}, ${contracts.memberId})`))
+      .innerJoin(users, eq(users.id, members.userId))
+      .leftJoin(resources, eq(resources.id, contracts.resourceId))
+      .where(and(eq(depositEntries.locationId, p.locationId), gte(depositEntries.occurredAt, w.start), lt(depositEntries.occurredAt, w.end)))
+      .orderBy(desc(depositEntries.occurredAt))
+      .all(),
+    amenityFinance(db, p.locationId, w.start, w.end),
+    unappliedOf(db, p.locationId),
+  ]);
   const months = monthsOf(p.from, p.to);
   const monthOf = (iso: string) => localDate(iso, tz).slice(0, 7);
   const index = new Map(months.map((m, i) => [m, i]));
   const blank = () => months.map(() => 0);
   const total = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
 
-  const spend = await db
-    .select({ amountCents: expenses.amountCents, category: expenses.category, incurredOn: expenses.incurredOn })
-    .from(expenses)
-    .where(and(eq(expenses.locationId, p.locationId), gte(expenses.incurredOn, p.from), lte(expenses.incurredOn, p.to)))
-    .all();
   const income = core.incomeEntries(books, w);
   const collectedCents = core.collectedCents(books, w);
   const taxCents = core.taxCollectedCents(books, w);
@@ -250,33 +252,12 @@ export async function financeReport(db: Db, p: { locationId: string; from: strin
   }
   const incomeCents = collectedCents - taxCents;
 
-  // The period just before, as long as this one, on the same definitions.
-  const span = daysBetween(p.from, p.to) + 1;
-  const prevTo = addDays(p.from, -1);
-  const prevFrom = addDays(p.from, -span);
-  const pw = window(prevFrom, prevTo);
-  const prevCollected = core.collectedCents(books, pw);
-  const prevExpenses = (await db
-    .select({ v: sumOf(expenses.amountCents) })
-    .from(expenses)
-    .where(and(eq(expenses.locationId, p.locationId), gte(expenses.incurredOn, prevFrom), lte(expenses.incurredOn, prevTo)))
-    .get())!.v;
+  const prevCollected = core.collectedCents(books, window(prevFrom, prevTo));
+  const prevExpenses = prevExpenseRow!.v;
 
   // Deposits: what moved in the range, and what is held at its end.
-  const depositMoves = await db
-    .select({ e: depositEntries, memberName: users.name, resourceName: resources.name })
-    .from(depositEntries)
-    .leftJoin(contracts, eq(contracts.id, depositEntries.contractId))
-    .innerJoin(members, eq(members.id, sql`coalesce(${depositEntries.memberId}, ${contracts.memberId})`))
-    .innerJoin(users, eq(users.id, members.userId))
-    .leftJoin(resources, eq(resources.id, contracts.resourceId))
-    .where(and(eq(depositEntries.locationId, p.locationId), gte(depositEntries.occurredAt, w.start), lt(depositEntries.occurredAt, w.end)))
-    .orderBy(desc(depositEntries.occurredAt))
-    .all();
   const moved = (kind: string) => total(depositMoves.filter((x) => x.e.kind === kind).map((x) => x.e.amountCents));
 
-  const amenity = await amenityFinance(db, p.locationId, w.start, w.end);
-  const unapplied = await unappliedOf(db, p.locationId);
   const byCategory = (key: core.IncomeCategory) => total(income.filter((e) => e.category === key).map((e) => e.amountCents));
 
   return {
@@ -339,14 +320,16 @@ export async function financeCharts(db: Db, p: { locationId: string; from: strin
   const loc = await loadLocation(db, p.locationId);
   const tz = loc.timezone;
   const window = (from: string, to: string) => ({ start: zonedToUtc(from, '00:00', tz).toISOString(), end: zonedToUtc(addDays(to, 1), '00:00', tz).toISOString() });
-  const books = await loadBooks(db, p.locationId);
+  const [books, spend] = await Promise.all([
+    loadBooks(db, p.locationId),
+    db
+      .select({ amountCents: expenses.amountCents, category: expenses.category, incurredOn: expenses.incurredOn })
+      .from(expenses)
+      .where(and(eq(expenses.locationId, p.locationId), gte(expenses.incurredOn, p.from), lte(expenses.incurredOn, p.to)))
+      .all(),
+  ]);
   const today = todayIn(tz, now);
   const total = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
-  const spend = await db
-    .select({ amountCents: expenses.amountCents, category: expenses.category, incurredOn: expenses.incurredOn })
-    .from(expenses)
-    .where(and(eq(expenses.locationId, p.locationId), gte(expenses.incurredOn, p.from), lte(expenses.incurredOn, p.to)))
-    .all();
 
   const months = monthsOf(p.from, p.to).map((month) => {
     const end = addDays(`${addMonths(month, 1)}-01`, -1);
@@ -386,13 +369,15 @@ export async function financeCharts(db: Db, p: { locationId: string; from: strin
   };
   const bySpace = sumBy('resourceId');
   const byPlan = sumBy('planId');
-  const spaceNames = bySpace.size ? await db.select({ id: resources.id, name: resources.name, kind: resources.kind }).from(resources).where(inArray(resources.id, [...bySpace.keys()])).all() : [];
-  const planNames = byPlan.size ? await db.select({ id: plans.id, name: plans.name }).from(plans).where(inArray(plans.id, [...byPlan.keys()])).all() : [];
   const end = p.to < today ? p.to : today;
   const debtors = core.topDebtors(books.invoices, books.payments, end, tz);
-  const names = debtors.length
-    ? await db.select({ id: members.id, name: users.name, company: members.company }).from(members).innerJoin(users, eq(users.id, members.userId)).where(inArray(members.id, debtors.map((d) => d.memberId))).all()
-    : [];
+  const [spaceNames, planNames, names] = await Promise.all([
+    bySpace.size ? db.select({ id: resources.id, name: resources.name, kind: resources.kind }).from(resources).where(inArray(resources.id, [...bySpace.keys()])).all() : Promise.resolve([]),
+    byPlan.size ? db.select({ id: plans.id, name: plans.name }).from(plans).where(inArray(plans.id, [...byPlan.keys()])).all() : Promise.resolve([]),
+    debtors.length
+      ? db.select({ id: members.id, name: users.name, company: members.company }).from(members).innerJoin(users, eq(users.id, members.userId)).where(inArray(members.id, debtors.map((d) => d.memberId))).all()
+      : Promise.resolve([]),
+  ]);
 
   return {
     from: p.from,

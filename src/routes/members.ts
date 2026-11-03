@@ -77,23 +77,27 @@ export function membersRouter(db: Db) {
       const pat = `%${q.replace(/[%_]/g, '')}%`;
       conds.push(or(like(users.name, pat), like(users.email, pat), like(members.company, pat))!);
     }
-    const rows = await db
-      .select({ member: members, user: users, plan: plans })
-      .from(members)
-      .innerJoin(users, eq(users.id, members.userId))
-      .leftJoin(plans, eq(plans.id, members.planId))
-      .where(and(...conds))
-      .orderBy(asc(users.name))
-      .all();
-    const present = new Set(
-      (await db
-        .select({ memberId: attendance.memberId })
-        .from(attendance)
-        .where(and(eq(attendance.locationId, locationId), isNull(attendance.checkOutAt)))
-        .all())
-        .map((a) => a.memberId),
-    );
-    const companies = await contractCompanies(db, rows.map(({ member }) => member.id));
+    // Three independent reads at once (each is a round trip on Turso).
+    const [rows, here, companyRows] = await Promise.all([
+      db
+        .select({ member: members, user: users, plan: plans })
+        .from(members)
+        .innerJoin(users, eq(users.id, members.userId))
+        .leftJoin(plans, eq(plans.id, members.planId))
+        .where(and(...conds))
+        .orderBy(asc(users.name))
+        .all(),
+      db.select({ memberId: attendance.memberId }).from(attendance).where(and(eq(attendance.locationId, locationId), isNull(attendance.checkOutAt))).all(),
+      // The company each member came in through, for everyone at the location.
+      db
+        .select({ memberId: contractPeople.memberId, company: contracts.companyName })
+        .from(contractPeople)
+        .innerJoin(contracts, eq(contracts.id, contractPeople.contractId))
+        .where(and(eq(contracts.locationId, locationId), ne(contracts.companyName, '')))
+        .all(),
+    ]);
+    const present = new Set(here.map((a) => a.memberId));
+    const companies = new Map(companyRows.map((r) => [r.memberId, r.company]));
     res.json(
       rows.map(({ member, user, plan }) => ({
         ...member,
@@ -248,41 +252,44 @@ export function membersRouter(db: Db) {
   r.get('/:id', async (req, res) => {
     const { member, user } = await loadMember(db, idParam(req));
     assertMemberAccess(req.user!, member);
-    const loc = await loadLocation(db, member.locationId);
-    const today = todayIn(loc.timezone);
-
-    const plan = member.planId ? await db.select().from(plans).where(eq(plans.id, member.planId)).get() : null;
-    const assigned = await db
-      .select({ assignment: resourceAssignments, resource: resources })
-      .from(resourceAssignments)
-      .innerJoin(resources, eq(resources.id, resourceAssignments.resourceId))
-      .where(eq(resourceAssignments.memberId, member.id))
-      .orderBy(desc(resourceAssignments.startDate))
-      .all();
-    const open = await db
-      .select()
-      .from(invoices)
-      .where(and(eq(invoices.memberId, member.id), eq(invoices.status, 'open')))
-      .all();
-    res.json({
-      ...member,
-      contractCompany: (await contractCompanies(db, [member.id])).get(member.id) ?? null,
-      name: user.name,
-      email: user.email,
-      phone: user.phone,
-      devicePin: user.devicePin,
-      plan,
-      shifts: await db
+    // Everything about the member at once (each read is a round trip on Turso), then today's amenity use, which needs the local date.
+    const [loc, plan, assigned, open, companies, shifts, amenityOwedCents, moneyEntries, desks] = await Promise.all([
+      loadLocation(db, member.locationId),
+      member.planId ? db.select().from(plans).where(eq(plans.id, member.planId)).get() : Promise.resolve(null),
+      db
+        .select({ assignment: resourceAssignments, resource: resources })
+        .from(resourceAssignments)
+        .innerJoin(resources, eq(resources.id, resourceAssignments.resourceId))
+        .where(eq(resourceAssignments.memberId, member.id))
+        .orderBy(desc(resourceAssignments.startDate))
+        .all(),
+      db.select().from(invoices).where(and(eq(invoices.memberId, member.id), eq(invoices.status, 'open'))).all(),
+      contractCompanies(db, [member.id]),
+      db
         .select({ id: shiftTemplates.id, name: shiftTemplates.name, startTime: shiftTemplates.startTime, endTime: shiftTemplates.endTime, priceCents: shiftTemplates.priceCents })
         .from(memberShifts)
         .innerJoin(shiftTemplates, eq(shiftTemplates.id, memberShifts.shiftId))
         .where(eq(memberShifts.memberId, member.id))
         .orderBy(asc(shiftTemplates.startTime))
         .all(),
+      amenityOwed(db, member.id),
+      db.select().from(depositEntries).where(eq(depositEntries.memberId, member.id)).orderBy(asc(depositEntries.occurredAt)).all(),
+      db.select({ id: resources.id, name: resources.name, kind: resources.kind }).from(memberDesks).innerJoin(resources, eq(resources.id, memberDesks.resourceId)).where(eq(memberDesks.memberId, member.id)).all(),
+    ]);
+    const today = todayIn(loc.timezone);
+    res.json({
+      ...member,
+      contractCompany: companies.get(member.id) ?? null,
+      name: user.name,
+      email: user.email,
+      phone: user.phone,
+      devicePin: user.devicePin,
+      plan: plan ?? null,
+      shifts,
       amenities: await memberAllowance(db, member.id, today),
-      amenityOwedCents: await amenityOwed(db, member.id),
-      moneyEntries: await db.select().from(depositEntries).where(eq(depositEntries.memberId, member.id)).orderBy(asc(depositEntries.occurredAt)).all(),
-      desks: await db.select({ id: resources.id, name: resources.name, kind: resources.kind }).from(memberDesks).innerJoin(resources, eq(resources.id, memberDesks.resourceId)).where(eq(memberDesks.memberId, member.id)).all(),
+      amenityOwedCents,
+      moneyEntries,
+      desks,
       assignments: assigned.map(({ assignment, resource }) => ({
         ...assignment,
         resourceName: resource.name,

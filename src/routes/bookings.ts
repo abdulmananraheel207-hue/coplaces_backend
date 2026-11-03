@@ -34,52 +34,40 @@ export function bookingsRouter(db: Db) {
     const range = dayRange(date, loc.timezone);
     const user = req.user!;
 
-    const bookable = (await db
-      .select()
-      .from(resources)
-      .where(eq(resources.locationId, locationId))
-      .all())
-      // Only spaces with an hourly price are booked by the hour, so only those are on the booking grid.
-      .filter((x) => x.status !== 'retired' && isPriced(x))
-      .sort((a, b) => byName(a.name, b.name));
-    const rows = await db
-      .select({ b: bookings, memberName: users.name })
-      .from(bookings)
-      .innerJoin(members, eq(members.id, bookings.memberId))
-      .innerJoin(users, eq(users.id, members.userId))
-      .where(
-        and(
-          eq(bookings.locationId, locationId),
-          inArray(bookings.status, ['confirmed', 'completed']),
-          lt(bookings.startsAt, range.end),
-          gte(bookings.endsAt, range.start),
-        ),
-      )
-      .all();
-
-    // Desks someone is sitting at today without a booking of their own show as in use.
-    const inUse =
-      date === todayIn(loc.timezone)
-        ? (await db
+    // The reads are independent, so they go together (each is a round trip on Turso).
+    const isToday = date === todayIn(loc.timezone);
+    const [spaces, rows, sitting, closed] = await Promise.all([
+      db.select().from(resources).where(eq(resources.locationId, locationId)).all(),
+      db
+        .select({ b: bookings, memberName: users.name })
+        .from(bookings)
+        .innerJoin(members, eq(members.id, bookings.memberId))
+        .innerJoin(users, eq(users.id, members.userId))
+        .where(and(eq(bookings.locationId, locationId), inArray(bookings.status, ['confirmed', 'completed']), lt(bookings.startsAt, range.end), gte(bookings.endsAt, range.start)))
+        .all(),
+      // Desks someone is sitting at today without a booking of their own show as in use.
+      isToday
+        ? db
             .select({ resourceId: attendance.resourceId, memberId: attendance.memberId, memberName: users.name })
             .from(attendance)
             .innerJoin(members, eq(members.id, attendance.memberId))
             .innerJoin(users, eq(users.id, members.userId))
             .where(and(eq(attendance.locationId, locationId), isNull(attendance.checkOutAt), gte(attendance.checkInAt, range.start), lt(attendance.checkInAt, range.end)))
-            .all())
-            .filter((a) => a.resourceId)
-            .map((a) => ({
-              resourceId: a.resourceId!,
-              mine: a.memberId === user.memberId,
-              memberName: isStaff(user) ? a.memberName : undefined,
-            }))
-        : [];
+            .all()
+        : Promise.resolve([]),
+      closedReason(db, loc, date),
+    ]);
+    // Only spaces with an hourly price are booked by the hour, so only those are on the booking grid.
+    const bookable = spaces.filter((x) => x.status !== 'retired' && isPriced(x)).sort((a, b) => byName(a.name, b.name));
+    const inUse = sitting
+      .filter((a) => a.resourceId)
+      .map((a) => ({ resourceId: a.resourceId!, mine: a.memberId === user.memberId, memberName: isStaff(user) ? a.memberName : undefined }));
 
     res.json({
       date,
       timezone: loc.timezone,
       inUse,
-      closed: await closedReason(db, loc, date),
+      closed,
       openTime: loc.openTime,
       closeTime: loc.closeTime,
       resources: bookable,

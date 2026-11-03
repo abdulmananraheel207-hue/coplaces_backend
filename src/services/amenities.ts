@@ -33,19 +33,21 @@ export async function setMemberAmenities(t: Db, memberId: string, locationId: st
 
 /** What a member gets free each day, with the amenity's name and price and how many they have had today. */
 export async function memberAllowance(db: Db, memberId: string, today: string) {
-  const rows = await db
-    .select({ amenityId: amenities.id, name: amenities.name, priceCents: amenities.priceCents, active: amenities.active, freePerDay: memberAmenities.freePerDay })
-    .from(memberAmenities)
-    .innerJoin(amenities, eq(amenities.id, memberAmenities.amenityId))
-    .where(eq(memberAmenities.memberId, memberId))
-    .orderBy(asc(amenities.name))
-    .all();
-  const had = await db
-    .select({ amenityId: amenityOrders.amenityId, n: sql<number>`coalesce(sum(${amenityOrders.quantity}), 0)` })
-    .from(amenityOrders)
-    .where(and(eq(amenityOrders.memberId, memberId), eq(amenityOrders.date, today)))
-    .groupBy(amenityOrders.amenityId)
-    .all();
+  const [rows, had] = await Promise.all([
+    db
+      .select({ amenityId: amenities.id, name: amenities.name, priceCents: amenities.priceCents, active: amenities.active, freePerDay: memberAmenities.freePerDay })
+      .from(memberAmenities)
+      .innerJoin(amenities, eq(amenities.id, memberAmenities.amenityId))
+      .where(eq(memberAmenities.memberId, memberId))
+      .orderBy(asc(amenities.name))
+      .all(),
+    db
+      .select({ amenityId: amenityOrders.amenityId, n: sql<number>`coalesce(sum(${amenityOrders.quantity}), 0)` })
+      .from(amenityOrders)
+      .where(and(eq(amenityOrders.memberId, memberId), eq(amenityOrders.date, today)))
+      .groupBy(amenityOrders.amenityId)
+      .all(),
+  ]);
   return rows.map((r) => ({ ...r, usedToday: had.find((h) => h.amenityId === r.amenityId)?.n ?? 0 }));
 }
 
@@ -54,14 +56,17 @@ export async function memberAllowance(db: Db, memberId: string, today: string) {
  * the owner did not tick for them: they can still order it, and pay the price) and how many they have had today.
  */
 export async function memberMenu(db: Db, memberId: string, locationId: string, today: string) {
-  const offered = await db.select().from(amenities).where(and(eq(amenities.locationId, locationId), eq(amenities.active, true))).orderBy(asc(amenities.name)).all();
-  const free = new Map((await db.select().from(memberAmenities).where(eq(memberAmenities.memberId, memberId)).all()).map((m) => [m.amenityId, m.freePerDay]));
-  const had = await db
-    .select({ amenityId: amenityOrders.amenityId, n: sql<number>`coalesce(sum(${amenityOrders.quantity}), 0)` })
-    .from(amenityOrders)
-    .where(and(eq(amenityOrders.memberId, memberId), eq(amenityOrders.date, today)))
-    .groupBy(amenityOrders.amenityId)
-    .all();
+  const [offered, freeRows, had] = await Promise.all([
+    db.select().from(amenities).where(and(eq(amenities.locationId, locationId), eq(amenities.active, true))).orderBy(asc(amenities.name)).all(),
+    db.select().from(memberAmenities).where(eq(memberAmenities.memberId, memberId)).all(),
+    db
+      .select({ amenityId: amenityOrders.amenityId, n: sql<number>`coalesce(sum(${amenityOrders.quantity}), 0)` })
+      .from(amenityOrders)
+      .where(and(eq(amenityOrders.memberId, memberId), eq(amenityOrders.date, today)))
+      .groupBy(amenityOrders.amenityId)
+      .all(),
+  ]);
+  const free = new Map(freeRows.map((m) => [m.amenityId, m.freePerDay]));
   return offered.map((a) => ({ amenityId: a.id, name: a.name, priceCents: a.priceCents, active: a.active, freePerDay: free.get(a.id) ?? 0, usedToday: had.find((h) => h.amenityId === a.id)?.n ?? 0 }));
 }
 
@@ -155,19 +160,21 @@ export async function listOrders(db: Db, locationId: string, memberId?: string) 
 
 /** For finance: what is owed at the desk and by whom, and what was collected in a stretch of time (income on the day it was collected). */
 export async function amenityFinance(db: Db, locationId: string, start: string, end: string) {
-  const owedRows = await db
-    .select({ memberId: amenityOrders.memberId, name: users.name, owedCents: sql<number>`sum(${amenityOrders.chargeCents})` })
-    .from(amenityOrders)
-    .innerJoin(members, eq(members.id, amenityOrders.memberId))
-    .innerJoin(users, eq(users.id, members.userId))
-    .where(and(eq(amenityOrders.locationId, locationId), isNull(amenityOrders.collectedAt), isNull(amenityOrders.invoiceId)))
-    .groupBy(amenityOrders.memberId, users.name)
-    .all();
-  const collected = await db
-    .select({ amountCents: amenityOrders.chargeCents, paidAt: amenityOrders.collectedAt })
-    .from(amenityOrders)
-    .where(and(eq(amenityOrders.locationId, locationId), sql`${amenityOrders.chargeCents} > 0`, sql`${amenityOrders.collectedAt} >= ${start}`, sql`${amenityOrders.collectedAt} < ${end}`))
-    .all();
+  const [owedRows, collected] = await Promise.all([
+    db
+      .select({ memberId: amenityOrders.memberId, name: users.name, owedCents: sql<number>`sum(${amenityOrders.chargeCents})` })
+      .from(amenityOrders)
+      .innerJoin(members, eq(members.id, amenityOrders.memberId))
+      .innerJoin(users, eq(users.id, members.userId))
+      .where(and(eq(amenityOrders.locationId, locationId), isNull(amenityOrders.collectedAt), isNull(amenityOrders.invoiceId)))
+      .groupBy(amenityOrders.memberId, users.name)
+      .all(),
+    db
+      .select({ amountCents: amenityOrders.chargeCents, paidAt: amenityOrders.collectedAt })
+      .from(amenityOrders)
+      .where(and(eq(amenityOrders.locationId, locationId), sql`${amenityOrders.chargeCents} > 0`, sql`${amenityOrders.collectedAt} >= ${start}`, sql`${amenityOrders.collectedAt} < ${end}`))
+      .all(),
+  ]);
   return {
     owedRows: owedRows.filter((r) => r.owedCents > 0).sort((a, b) => b.owedCents - a.owedCents),
     collected: collected.map((c) => ({ amountCents: c.amountCents, paidAt: c.paidAt! })),
