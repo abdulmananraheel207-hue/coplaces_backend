@@ -295,6 +295,27 @@ export function contractsRouter(db: Db) {
     res.json(out);
   });
 
+  /** Gives back what is left of a contract's advance that no invoice used. A billing control; audited. */
+  r.post('/:id/advance-refund', async (req, res) => {
+    const body = parse(z.object({ amountCents: money.optional(), method: z.enum(PAYMENT_METHODS).default('cash'), reference: z.string().trim().max(100).default('') }), req.body);
+    const user = req.user!;
+    assertCan(user, 'billing_admin');
+    const out = await db.transaction(async (tx) => {
+      const c = await tx.select().from(contracts).where(eq(contracts.id, idParam(req))).get();
+      if (!c) throw notFound('Contract');
+      assertSees(user, c.locationId, 'Contract');
+      const left = c.advanceReceivedAt ? c.advanceCents - c.advanceUsedCents : 0;
+      const amount = body.amountCents ?? left;
+      if (left <= 0) throw conflict('Nothing is left of this advance to give back');
+      if (amount <= 0 || amount > left) throw badRequest(`Up to ${left} can be given back`);
+      const now = new Date().toISOString();
+      await tx.insert(depositEntries).values({ locationId: c.locationId, contractId: c.id, kind: 'advance_refund', amountCents: amount, method: body.method, reference: body.reference, occurredAt: now, recordedById: user.id }).run();
+      await audit(tx, { organizationId: user.organizationId, locationId: c.locationId, actorId: user.id, action: 'advance.refund', entity: 'contract', entityId: c.id, amountCents: amount, data: { method: body.method, reference: body.reference } });
+      return tx.update(contracts).set({ advanceUsedCents: c.advanceUsedCents + amount }).where(eq(contracts.id, c.id)).returning().get();
+    });
+    res.json(out);
+  });
+
   // A security deposit is money held for the member, not income. Each movement is written to the ledger so it can be matched
   // against cash and the bank; only what the space keeps becomes income, and only when it is kept.
   r.post('/:id/deposit', async (req, res) => {

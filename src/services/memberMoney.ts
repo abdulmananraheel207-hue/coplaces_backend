@@ -28,10 +28,10 @@ export interface MoneyInput {
 /** How many days before a plan period ends the deposit may be settled, the same window as renewing. */
 const SETTLE_DAYS_BEFORE = 2;
 
-const ACTIONS = { advance: 'advance.receive', received: 'deposit.receive', refunded: 'deposit.refund', kept: 'deposit.keep' } as const;
+const ACTIONS = { advance: 'advance.receive', advance_refund: 'advance.refund', received: 'deposit.receive', refunded: 'deposit.refund', kept: 'deposit.keep' } as const;
 
 /** One movement of a member's money: written to the ledger the reports read, and to the audit log. */
-async function entry(t: Db, actor: AuthUser, member: { id: string; locationId: string }, kind: 'advance' | 'received' | 'refunded' | 'kept', amountCents: number, method: Method | null, reference: string) {
+async function entry(t: Db, actor: AuthUser, member: { id: string; locationId: string }, kind: 'advance' | 'advance_refund' | 'received' | 'refunded' | 'kept', amountCents: number, method: Method | null, reference: string) {
   await t.insert(depositEntries).values({ locationId: member.locationId, memberId: member.id, kind, amountCents, method, reference, occurredAt: new Date().toISOString(), recordedById: actor.id }).run();
   await audit(t, { organizationId: actor.organizationId, locationId: member.locationId, actorId: actor.id, action: ACTIONS[kind], entity: 'member', entityId: member.id, amountCents, data: { method, reference } });
 }
@@ -102,5 +102,23 @@ export async function settleMemberDeposit(db: Db, actor: AuthUser, memberId: str
     if (returned > 0) await entry(t, actor, member, 'refunded', returned, input.method, input.reference);
     if (returned < member.depositCents) await entry(t, actor, member, 'kept', member.depositCents - returned, null, input.reference);
     return t.update(members).set({ depositStatus: returned === 0 ? 'forfeited' : 'refunded', depositReturnedCents: returned }).where(eq(members.id, member.id)).returning().get();
+  });
+}
+
+/**
+ * Gives back part or all of a member's advance that no invoice has used, for example when they leave. The money goes back on the day it
+ * is refunded (negative income then), and what is refunded counts as used, so it can never also come off an invoice.
+ */
+export function refundMemberAdvance(db: Db, actor: AuthUser, memberId: string, input: { amountCents?: number | undefined; method: Method; reference: string }) {
+  return db.transaction(async (tx) => {
+    const t = tx as unknown as Db;
+    const { member } = await loadMember(t, memberId);
+    assertSees(actor, member.locationId, 'Member');
+    const left = member.advanceCents - member.advanceUsedCents;
+    const amount = input.amountCents ?? left;
+    if (left <= 0) throw conflict('Nothing is left of this member\'s advance to give back');
+    if (amount <= 0 || amount > left) throw badRequest(`Up to ${left} can be given back`);
+    await entry(t, actor, member, 'advance_refund', amount, input.method, input.reference);
+    return t.update(members).set({ advanceUsedCents: member.advanceUsedCents + amount }).where(eq(members.id, member.id)).returning().get();
   });
 }

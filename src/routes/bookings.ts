@@ -6,7 +6,7 @@ import { BOOKING_STATUSES, attendance, bookings, members, resources, users } fro
 import { loadLocation, requireLocationId } from '../lib/access.js';
 import { assertLocation, isStaff } from '../lib/auth.js';
 import { assertCan, requirePermission } from '../lib/permissions.js';
-import { badRequest, forbidden, notFound } from '../lib/errors.js';
+import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
 import { isPriced } from '../catalogue.js';
 import { idParam, queryString } from '../lib/http.js';
 import { addDays, dayRange, isValidDate, TIME_RE, todayIn, zonedToUtc } from '../lib/time.js';
@@ -199,6 +199,8 @@ export function bookingsRouter(db: Db) {
     if (!b) throw notFound('Booking');
     assertLocation(req.user!, b.locationId);
     if (b.status === 'cancelled') throw badRequest('Cancelled bookings cannot be changed');
+    // What was billed stands: marking an invoiced booking a no-show would leave its charge on the invoice.
+    if (b.invoiceId && body.status !== b.status) throw conflict('This booking is on an invoice. Void the invoice first to change it.');
     res.json(await db.update(bookings).set({ status: body.status }).where(eq(bookings.id, b.id)).returning().get());
   });
 

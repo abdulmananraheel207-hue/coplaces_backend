@@ -42,7 +42,7 @@ export interface PaymentRow {
 }
 
 export interface LedgerRow {
-  kind: 'received' | 'refunded' | 'kept' | 'advance';
+  kind: 'received' | 'refunded' | 'kept' | 'advance' | 'advance_refund';
   amountCents: number;
   occurredAt: string;
 }
@@ -315,6 +315,7 @@ export function incomeEntries(b: Books, w: InstantWindow): IncomeEntry[] {
   for (const e of b.ledger) {
     if (!inWindow(e.occurredAt, w)) continue;
     if (e.kind === 'advance') out.push({ at: e.occurredAt, amountCents: e.amountCents, category: 'advance', method: e.method ?? 'other', resourceId: null, planId: null });
+    if (e.kind === 'advance_refund') out.push({ at: e.occurredAt, amountCents: -e.amountCents, category: 'advance', method: e.method ?? 'other', resourceId: null, planId: null });
     if (e.kind === 'kept') out.push({ at: e.occurredAt, amountCents: e.amountCents, category: 'kept_deposit', method: 'kept_deposit', resourceId: null, planId: null });
   }
   for (const o of b.amenityOrders) {
@@ -340,6 +341,7 @@ export function moneyInByMethod(b: Books, w: InstantWindow) {
   for (const e of b.ledger) {
     if (!inWindow(e.occurredAt, w)) continue;
     if (e.kind === 'advance') add(e.method ?? 'other', e.amountCents);
+    if (e.kind === 'advance_refund') add(e.method ?? 'other', -e.amountCents);
     if (e.kind === 'kept') add('kept_deposit', e.amountCents);
   }
   for (const o of b.amenityOrders) if (o.chargeCents > 0 && o.collectedAt && !o.invoiceId && inWindow(o.collectedAt, w)) add('other', o.chargeCents);

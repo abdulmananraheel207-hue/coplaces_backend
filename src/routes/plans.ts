@@ -1,12 +1,12 @@
 import { Router } from 'express';
-import { and, asc, eq } from 'drizzle-orm';
+import { and, asc, eq, ne } from 'drizzle-orm';
 import { z } from 'zod';
 import type { Db } from '../db/client.js';
 import { PLAN_INTERVALS, members, plans, shiftTemplates } from '../db/schema.js';
 import { requireLocationId } from '../lib/access.js';
 import { assertLocation, staffOnly } from '../lib/auth.js';
 import { requirePermission } from '../lib/permissions.js';
-import { notFound } from '../lib/errors.js';
+import { conflict, notFound } from '../lib/errors.js';
 import { idParam } from '../lib/http.js';
 import { parse } from '../lib/validate.js';
 import { money } from '../lib/money.js';
@@ -53,6 +53,9 @@ export function plansRouter(db: Db) {
     const plan = await db.select().from(plans).where(eq(plans.id, idParam(req))).get();
     if (!plan) throw notFound('Plan');
     assertLocation(req.user!, plan.locationId);
+    // Members on it have bookings and invoices made by it. Move them to another plan (which re-bills them) before it goes.
+    const on = await db.select({ id: members.id }).from(members).where(and(eq(members.planId, plan.id), ne(members.status, 'cancelled'))).all();
+    if (on.length) throw conflict(`${on.length} member${on.length === 1 ? ' is' : 's are'} on this plan. Move them to another plan first.`);
     await db.transaction(async (tx) => {
       await tx.update(members).set({ planId: null }).where(eq(members.planId, plan.id)).run();
       await tx.delete(shiftTemplates).where(eq(shiftTemplates.planId, plan.id)).run();

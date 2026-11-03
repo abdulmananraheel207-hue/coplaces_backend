@@ -183,3 +183,68 @@ describe('changing plan part way through a period', () => {
     expect((await rows.member(ctx, mem.id))!).toMatchObject({ creditCents: credit, creditUsedCents: credit });
   });
 });
+
+describe('loose ends that touched money', () => {
+  it('gives back what is left of a member advance: income goes down that day, and it cannot also come off an invoice', async () => {
+    const ctx = await setup();
+    const owner = await ownerOf(ctx);
+    await owner.post(`/api/members/${ctx.basic.member.id}/money`).send({ advanceCents: 10_000, method: 'card' }).expect(204);
+    const clerk = await (await import('./helpers/finance.js')).staffWith(ctx, owner, 'clerk@test.dev', ['members', 'invoices']);
+    await clerk.post(`/api/members/${ctx.basic.member.id}/advance-refund`).send({ method: 'card' }).expect(403); // a billing control
+    await owner.post(`/api/members/${ctx.basic.member.id}/advance-refund`).send({ amountCents: 10_001, method: 'card' }).expect(400);
+    await owner.post(`/api/members/${ctx.basic.member.id}/advance-refund`).send({ amountCents: 4_000, method: 'card' }).expect(200);
+    expect((await rows.member(ctx, ctx.basic.member.id))!).toMatchObject({ advanceCents: 10_000, advanceUsedCents: 4_000 });
+    const rep = (await owner.get(`/api/reports/finance?locationId=${ctx.loc.id}&from=${today().slice(0, 7)}-01&to=${today()}`).expect(200)).body;
+    expect(rep.totals.collectedCents).toBe(6_000);
+    expect(rep.paymentsByMethod).toEqual([{ method: 'card', amountCents: 6_000 }]);
+    expect(rep.incomeByKind.find((k: { kind: string }) => k.kind === 'advance').amountCents).toBe(6_000);
+    // The 6,000 left comes off the next invoice, no more.
+    await generate(owner, ctx.loc.id, today().slice(0, 7));
+    const bill = (await invoicesOf(ctx, ctx.basic.member.id))[0]!;
+    expect(bill.items.find((l) => l.category === 'advance')!.amountCents).toBe(-5_000); // the 5,000 plan price is all it can take
+    await owner.post(`/api/members/${ctx.basic.member.id}/advance-refund`).send({ method: 'card' }).expect(200); // the last 1,000
+    await owner.post(`/api/members/${ctx.basic.member.id}/advance-refund`).send({ method: 'card' }).expect(409);
+  });
+
+  it('gives back what is left of a contract advance', async () => {
+    const ctx = await setup();
+    const owner = await ownerOf(ctx);
+    const c = (await owner.post('/api/contracts').send({ locationId: ctx.loc.id, memberId: ctx.basic.member.id, startDate: today(), advanceCents: 50_000 }).expect(201)).body;
+    await owner.post(`/api/contracts/${c.id}/advance`).send({ method: 'cash' }).expect(200);
+    const back = (await owner.post(`/api/contracts/${c.id}/advance-refund`).send({ method: 'cash' }).expect(200)).body;
+    expect(back.advanceUsedCents).toBe(50_000);
+    const log = (await owner.get(`/api/audit?locationId=${ctx.loc.id}&action=advance.refund`).expect(200)).body;
+    expect(log).toHaveLength(1);
+  });
+
+  it('keeps an invoiced booking as it was billed', async () => {
+    const ctx = await setup();
+    const owner = await ownerOf(ctx);
+    const month = monthFromNow(-1);
+    await ctx.db.update(members).set({ startDate: `${month}-01` }).where(eq(members.id, ctx.basic.member.id)).run();
+    const by = (await import('./helpers/finance.js')).ownerUserId;
+    const { bookings } = await import('../src/db/schema.js');
+    const { zonedToUtc } = await import('../src/lib/time.js');
+    const { TZ } = await import('./helpers.js');
+    const b = await ctx.db
+      .insert(bookings)
+      .values({ locationId: ctx.loc.id, resourceId: ctx.room.id, memberId: ctx.basic.member.id, startsAt: zonedToUtc(`${month}-10`, '10:00', TZ).toISOString(), endsAt: zonedToUtc(`${month}-10`, '11:00', TZ).toISOString(), status: 'completed', billableMinutes: 60, priceCents: 6_000, createdById: await by(ctx) })
+      .returning()
+      .get();
+    await generate(owner, ctx.loc.id, month);
+    await owner.patch(`/api/bookings/${b.id}`).send({ status: 'no_show' }).expect(409);
+    await owner.patch(`/api/bookings/${b.id}`).send({ status: 'completed' }).expect(200); // the same status is fine
+  });
+
+  it('refuses to delete a plan members are on, and to change a shift plan around the plan change', async () => {
+    const ctx = await setup();
+    const owner = await ownerOf(ctx);
+    const p = await planWithShifts(ctx, owner);
+    const mem = await planMember(ctx, owner, p);
+    await owner.delete(`/api/plans/${p.plan.id}`).expect(409);
+    await owner.patch(`/api/members/${mem.id}`).send({ planId: ctx.proPlan.id }).expect(409);
+    await owner.patch(`/api/members/${mem.id}`).send({ planId: p.plan.id, notes: 'same plan' }).expect(200);
+    const empty = (await owner.post('/api/plans').send({ locationId: ctx.loc.id, name: 'Unused' }).expect(201)).body;
+    await owner.delete(`/api/plans/${empty.id}`).expect(204);
+  });
+});

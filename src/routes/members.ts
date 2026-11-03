@@ -29,13 +29,13 @@ import { DATE_RE, isValidDate, todayIn } from '../lib/time.js';
 import { finishBookingOnCheckOut } from '../services/checkin.js';
 import { amenityOwed, memberAllowance, setMemberAmenities } from '../services/amenities.js';
 import { deleteMember } from '../services/memberDelete.js';
-import { recordMemberMoney, settleMemberDeposit } from '../services/memberMoney.js';
+import { recordMemberMoney, refundMemberAdvance, settleMemberDeposit } from '../services/memberMoney.js';
 import { changePlan, freeSpacesForPlan, renewPlan, startPlanPeriod } from '../services/planBookings.js';
 import { syncUser } from '../services/devices.js';
 import { idParam } from '../lib/http.js';
 import { tempPassword } from '../lib/passwords.js';
 import { parse } from '../lib/validate.js';
-import { money } from '../lib/money.js';
+import { money, positiveMoney } from '../lib/money.js';
 
 const dateStr = z.string().refine(isValidDate, 'Use YYYY-MM-DD');
 /** The amenities a member gets free each day, and the meeting room credit hours (two make an hour) they get each month. */
@@ -233,6 +233,12 @@ export function membersRouter(db: Db) {
     res.json(await settleMemberDeposit(db, req.user!, idParam(req), body));
   });
 
+  /** Gives back what is left of a member's advance. A billing control. */
+  r.post('/:id/advance-refund', requirePermission('billing_admin'), async (req, res) => {
+    const body = parse(z.object({ amountCents: positiveMoney.optional(), method: z.enum(PAYMENT_METHODS).default('cash'), reference: z.string().trim().max(100).default('') }), req.body);
+    res.json(await refundMemberAdvance(db, req.user!, idParam(req), body));
+  });
+
   r.post('/:id/renew', requirePermission('members'), async (req, res) => {
     const body = parse(z.object({ startDate: dateStr.optional() }), req.body);
     if (hasFeature(req.user!, 'invoicing')) assertCan(req.user!, 'invoices'); // it makes an invoice
@@ -310,6 +316,11 @@ export function membersRouter(db: Db) {
     const { member, user } = await loadMember(db, idParam(req));
     assertSees(req.user!, member.locationId, 'Member');
     if (body.planId !== undefined) await checkPlan(db, body.planId, member.locationId);
+    // A member on a plan with shifts has bookings and an invoice made by it: changing it goes through the plan change, which re-books
+    // and re-bills. Setting the same plan again changes nothing.
+    if (body.planId !== undefined && body.planId !== member.planId && member.planStart) {
+      throw conflict('This member is on a plan with shifts. Change their plan from the plan section, so the bookings and the bill follow.');
+    }
     if (member.status === 'cancelled' && body.status && body.status !== 'cancelled') await assertWithinLimit(db, req.user!, 'members');
     if (body.email && body.email !== user.email) {
       if (await db.select().from(users).where(eq(users.email, body.email)).get()) throw conflict('That email is already in use');

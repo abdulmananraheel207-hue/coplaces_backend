@@ -67,7 +67,8 @@ export const BOOKING_SOURCES = ['manual', 'plan'] as const;
 export const PRICING_MODES = ['per_member', 'fixed'] as const;
 export const AMENITY_REQUEST_STATUSES = ['pending', 'served', 'declined', 'cancelled'] as const;
 export const DEPOSIT_STATUSES = ['pending', 'held', 'refunded', 'forfeited'] as const;
-export const DEPOSIT_ENTRY_KINDS = ['received', 'refunded', 'kept', 'advance'] as const;
+/** `advance_refund` gives back part of an advance that no invoice used: negative income on the day it goes back. */
+export const DEPOSIT_ENTRY_KINDS = ['received', 'refunded', 'kept', 'advance', 'advance_refund'] as const;
 /**
  * What an invoice line is for. Charges are what was sold; `advance` takes off money paid up front (already counted as income when it
  * was received); `credit` takes off money already paid on an earlier invoice (an unused, paid plan period).
@@ -85,6 +86,7 @@ export const AUDIT_ACTIONS = [
   'deposit.refund',
   'deposit.keep',
   'advance.receive',
+  'advance.refund',
   'credit.add',
   'amenities.collect',
   'platform_payment.record',
