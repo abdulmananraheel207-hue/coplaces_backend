@@ -264,7 +264,7 @@ export const members = sqliteTable(
     depositCents: integer('deposit_cents').notNull().default(0),
     depositStatus: text('deposit_status', { enum: DEPOSIT_STATUSES }).notNull().default('pending'),
     depositReturnedCents: integer('deposit_returned_cents').notNull().default(0),
-    /** Free meeting room time given to the member each month, in credit hours. Two credit hours are one hour. */
+    /** Not used any more: credit hours are now set per space, in member_credit_resources. */
     meetingCredits: integer('meeting_credits').notNull().default(0),
     /** Money already paid on an invoice for a period the member did not use (a plan changed part way). Taken off their next invoices. */
     creditCents: integer('credit_cents').notNull().default(0),
@@ -319,6 +319,8 @@ export const resources = sqliteTable(
     fullDayRateCents: integer('full_day_rate_cents'),
     /** The hourly (rooms) or daily (desks) rate for a member with no plan. */
     noPlanRateCents: integer('no_plan_rate_cents'),
+    /** The owner allows members' meeting room credit hours to be used on this space (set on the Pricing and credit hours tab). */
+    creditsAllowed: integer('credits_allowed', { mode: 'boolean' }).notNull().default(false),
     createdAt: createdAt(),
   },
   (t) => [uniqueIndex('resources_location_name_idx').on(t.locationId, t.name)],
@@ -876,6 +878,22 @@ export const memberAmenities = sqliteTable(
     freePerDay: integer('free_per_day').notNull(),
   },
   (t) => [primaryKey({ columns: [t.memberId, t.amenityId] })],
+);
+
+/** The spaces a member gets free credit hours on, and how many on each. They only count while the space still has creditsAllowed. */
+export const memberCreditResources = sqliteTable(
+  'member_credit_resources',
+  {
+    memberId: text('member_id')
+      .notNull()
+      .references(() => members.id, { onDelete: 'cascade' }),
+    resourceId: text('resource_id')
+      .notNull()
+      .references(() => resources.id, { onDelete: 'cascade' }),
+    /** Credit hours a month the member gets free on this space. Two credit hours are one hour. */
+    credits: integer('credits').notNull().default(0),
+  },
+  (t) => [primaryKey({ columns: [t.memberId, t.resourceId] })],
 );
 
 /** One amenity handed to a member at the front desk. What goes beyond their free amount for the day is charged, and collected later. */

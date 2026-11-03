@@ -7,6 +7,7 @@ import { hasFeature } from '../lib/auth.js';
 import { forbidden } from '../lib/errors.js';
 import { dayRange, localDate, minutesBetween, monthRange, todayIn } from '../lib/time.js';
 import { amenityOwed, listAmenityRequests, memberMenu } from '../services/amenities.js';
+import { creditResources, freeUsage } from '../services/meetingCredits.js';
 import { overstayers } from '../services/checkin.js';
 import { withBalance } from '../services/billing.js';
 import { isWholeDay } from '../services/bookings.js';
@@ -24,7 +25,7 @@ export function meRouter(db: Db) {
     const nowIso = now.toISOString();
     const today = todayIn(loc.timezone, now);
     const month = monthRange(today.slice(0, 7), loc.timezone);
-    const [plan, checkedIn, upcoming, openRows, expectedVisitors, monthBookings, menu, amenityDueCents, amenityRequestList, overstay] = await Promise.all([
+    const [plan, checkedIn, upcoming, openRows, expectedVisitors, monthBookings, credit, menu, amenityDueCents, amenityRequestList, overstay] = await Promise.all([
       member.planId ? db.select().from(plans).where(eq(plans.id, member.planId)).get() : Promise.resolve(undefined),
       db.select().from(attendance).where(and(eq(attendance.memberId, member.id), isNull(attendance.checkOutAt))).get(),
       db
@@ -50,11 +51,12 @@ export function meRouter(db: Db) {
         : Promise.resolve([]),
       // Included meeting minutes consumed this month (live room bookings only).
       db
-        .select({ startsAt: bookings.startsAt, endsAt: bookings.endsAt, billable: bookings.billableMinutes })
+        .select({ resourceId: bookings.resourceId, kind: resources.kind, startsAt: bookings.startsAt, endsAt: bookings.endsAt, billable: bookings.billableMinutes })
         .from(bookings)
         .innerJoin(resources, eq(resources.id, bookings.resourceId))
-        .where(and(eq(bookings.memberId, member.id), eq(resources.kind, 'room'), inArray(bookings.status, ['confirmed', 'completed']), gte(bookings.startsAt, month.start), lt(bookings.startsAt, month.end)))
+        .where(and(eq(bookings.memberId, member.id), inArray(bookings.status, ['confirmed', 'completed']), gte(bookings.startsAt, month.start), lt(bookings.startsAt, month.end)))
         .all(),
+      creditResources(db, member.id),
       memberMenu(db, member.id, loc.id, today),
       amenityOwed(db, member.id),
       listAmenityRequests(db, user, loc.id),
@@ -62,7 +64,7 @@ export function meRouter(db: Db) {
     ]);
     const upcomingBookings = upcoming.map(({ b, resourceOpen, resourceClose, ...rest }) => ({ ...b, ...rest, allDay: isWholeDay(b, rest.resourceKind, resourceOpen ?? loc.openTime, resourceClose ?? loc.closeTime, loc.timezone) }));
     const open = openRows.map((i) => withBalance(i, today));
-    const usedMinutes = monthBookings.reduce((s, b) => s + (minutesBetween(b.startsAt, b.endsAt) - b.billable), 0);
+    const { creditUsed, planUsed } = freeUsage(monthBookings.map((b) => ({ resourceId: b.resourceId, kind: b.kind, free: minutesBetween(b.startsAt, b.endsAt) - b.billable })), credit);
 
     res.json({
       member: { id: member.id, company: member.company, status: member.status, locationId: loc.id, locationName: loc.name },
@@ -70,7 +72,8 @@ export function meRouter(db: Db) {
       timezone: loc.timezone,
       today: localDate(now, loc.timezone),
       plan: plan ?? null,
-      meetingMinutes: { included: (plan?.includedMeetingMinutes ?? 0) + member.meetingCredits * 30, used: usedMinutes },
+      meetingMinutes: { included: plan?.includedMeetingMinutes ?? 0, used: planUsed },
+      creditResources: credit.map((c) => ({ ...c, usedMinutes: creditUsed.get(c.id) ?? 0 })),
       amenities: menu,
       amenityDueCents,
       amenityRequests: amenityRequestList.slice(0, 8),
