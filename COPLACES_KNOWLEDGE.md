@@ -3,9 +3,9 @@
 > **Purpose of this file:** give any AI agent or new developer full knowledge of what Coplaces is, every feature, every business rule, and every edge case in the backend, so it can work on the code or answer questions without re-reading the whole repo.
 >
 > Repo: `coplaces_backend` (this repo). The web frontend is a separate repo (`coplaces_frontend`); in production this API can also serve the built web app from `WEB_DIST` (default `../web/dist`).
-> Last reviewed against commit `6fa7440` (origin/ahmed-dev), on branch `finance-overhaul`.
+> Last reviewed on branch `finance-overhaul` after the Stage 1B finance fixes.
 >
-> **Read §9 ("Finance rules as they behave today") before touching anything that involves money.** It lists known bugs (H1–H6) that are being fixed; do not assume the current finance behaviour is correct.
+> **Read §9 ("Finance rules") before touching anything that involves money.** All money definitions live in `src/services/financeCore.ts`; every change to money runs in one transaction and is written to the audit log.
 
 ---
 
@@ -353,10 +353,11 @@ GET `/?locationId` (team) · POST `/` (`plans`; `priceCents` optional, default 0
 | GET | `/?locationId&q&status` | any of members/front_desk/bookings/invoices/contracts | includes `planName`, `checkedIn`, `devicePin`, `contractCompany` |
 | POST | `/` | `members` | `{locationId, name, email, phone?, company?, planId?, status?, startDate?, notes?, password?, shiftIds[], deskIds[], advanceCents?, depositCents?, method?, reference?, amenities[{amenityId, freePerDay}], meetingCredits?}`. One transaction: user + member + free amenities + advance/deposit + first plan period. If the plan has shifts at least one must be chosen; desks need shifts; shifts need status active. |
 | GET | `/available-spaces?locationId&planId&shiftIds&startDate[&memberId]` | `members` | desks/offices free for those shifts over the plan period, and the period end |
-| PUT | `/:id/plan` | `members` | `{planId|null, shiftIds[], deskIds[], startDate?}` → `changePlan` (§8.4) |
-| POST | `/:id/renew` | `members` | `{startDate?}` → next period (opens 2 days before `planEnd`) |
-| POST | `/:id/money` | `members` | `{advanceCents?, depositCents?, method, reference}` — record a forgotten advance/deposit (each once) |
-| POST | `/:id/deposit` | `members` | `{action: refund|forfeit, returnedCents?, method, reference}` — settle the member's deposit |
+| PUT | `/:id/plan` | `members` (+ `invoices` when it bills) | `{planId|null, shiftIds[], deskIds[], startDate?}` → `changePlan` (§8.4) |
+| POST | `/:id/renew` | `members` (+ `invoices` when it bills) | `{startDate?}` → next period (opens 2 days before `planEnd`) |
+| POST | `/:id/money` | `members` + `invoices` | `{advanceCents?, depositCents?, method, reference}` — record a forgotten advance/deposit (each once); a late advance comes off their open invoice |
+| POST | `/:id/deposit` | `members` + `billing_admin` | `{action: refund|forfeit, returnedCents?, method, reference}` — settle the member's deposit |
+| POST | `/:id/advance-refund` | `billing_admin` | `{amountCents?, method, reference}` — give back what is left of the advance (negative income that day) |
 | DELETE | `/:id` | `members` | delete a member added by mistake (§8.12) |
 | GET | `/:id` | staff with location, or self | plan, shifts, desks, free amenities with today's use, `amenityOwedCents`, `moneyEntries` (ledger), assignments, `balanceDueCents`, `overdueCents`, `contractCompany` |
 | PATCH | `/:id` | `members` | `{name,email,phone,company,planId,status,startDate,endDate,notes,meetingCredits,amenities}`. Cancelling is refused while the member is the `memberId` of a draft/active contract; otherwise cancels future un-invoiced confirmed bookings, checks them out, disables login. **`planId` can be changed here directly, bypassing `changePlan`.** |
@@ -392,7 +393,7 @@ GET `/objects` · PUT `/` (`spaces`; atomic save of spaces, objects, retirements
 | PATCH | `/:id` | `bookings` | `{status: confirmed|completed|no_show}` (allowed even on an invoiced booking) |
 
 ### Contracts — `/api/contracts` (`contracts` permission; no feature gate)
-- Single contracts: GET `/?locationId&status&memberId` (company ones include `people`, `spaces`, `seats`, `extraPeople`) · POST `/` · PATCH `/:id` (refused for company contracts) · POST `/:id/activate` · `/:id/end {endDate?}` · `/:id/cancel` · GET `/:id/deposit-entries` · POST `/:id/advance {method?, reference?}` · POST `/:id/deposit {action: receive|refund|forfeit, returnedCents?, method?, reference?}`.
+- Single contracts: GET `/?locationId&status&memberId` (company ones include `people`, `spaces`, `seats`, `extraPeople`) · POST `/` · PATCH `/:id` (refused for company contracts) · POST `/:id/activate` · `/:id/end {endDate?}` · `/:id/cancel` · GET `/:id/deposit-entries` · POST `/:id/advance {method?, reference?}` · POST `/:id/deposit {action: receive|refund|forfeit, returnedCents?, method?, reference?}` (refund and forfeit need `billing_admin`) · POST `/:id/advance-refund {amountCents?, method, reference}` (`billing_admin`).
 - Company contracts:
   - GET `/available-spaces?locationId&startDate&endDate` — rooms/desks/offices with `free`/`busy` reason.
   - POST `/quote` `{locationId, pricingMode, pricePerMemberCents, extraMemberCents, fixedPriceCents, people:[{hasDesk}], spaceIds}` → `{seats, totalCents, extraPeople, lines}`.
@@ -409,8 +410,8 @@ GET `/objects` · PUT `/` (`spaces`; atomic save of spaces, objects, retirements
 | DELETE | `/:id` | `plans` | deactivated if it was ever given, else deleted |
 | GET | `/orders?locationId&memberId` | front_desk, invoices or reports | last 200 |
 | POST | `/orders` | `front_desk` | `{memberId, amenityId, quantity 1–100}` — free up to today's allowance, rest charged |
-| POST | `/invoice` | `invoices` (**no `invoicing` feature check**) | `{memberId}` — puts everything owed on a manual invoice now (due +7 days) |
-| POST | `/collect` | front_desk or invoices | `{memberId}` — marks everything owed as collected at the desk; returns `{collectedCents}` |
+| POST | `/invoice` | feature `invoicing` + `invoices` | `{memberId}` — puts everything owed on a manual invoice now (due +7 days) |
+| POST | `/collect` | front_desk or invoices | `{memberId, method?, reference?}` — with invoicing: an invoice for what is owed plus a payment on it (a receipt); without: marks the orders collected. Returns `{collectedCents, invoiceId, paymentId}` |
 | GET | `/requests?locationId&pending=1` | staff need front_desk; members see own | |
 | POST | `/requests` | members | `{amenityId, quantity 1–20}`; max 10 pending |
 | POST | `/requests/:id/cancel` · `/serve` · `/decline {reason?}` | member (cancel) / front_desk | serving records the order |
@@ -427,16 +428,19 @@ GET `/?locationId&date|open=1` (team) · **GET `/overstaying?locationId`** (team
 Unchanged; see §10.
 
 ### Invoices — `/api/invoices` (feature `invoicing`)
-GET `/?locationId&memberId&status(open|paid|void|overdue)&q` · GET `/:id` · POST `/` (`invoices`; manual: items with `quantity 1–10000`, `unitPriceCents ≥0`, no upper limit) · POST `/generate` (`billing_admin`; `{locationId, month, dueInDays 0–120 (7)}`) · POST `/:id/void` (`billing_admin`) · POST `/:id/payments` (`invoices`; `{amountCents ≥1, method, paidAt? (any ISO datetime), reference?, notes?}`).
+GET `/?locationId&memberId&status(open|paid|void|overdue)&q` · GET `/:id` · POST `/` (`invoices`; manual: items with `quantity 1–10000`, `unitPriceCents` 0–1e12) · POST `/generate` (`billing_admin`; `{locationId, month, dueInDays 0–120 (7)}`) · POST `/:id/void` (`billing_admin`) · POST `/:id/payments` (`invoices`; `{amountCents 1–1e13, method, paidAt? (not ahead, ≤5 years back), reference?, notes?}`). Rules: §9.2.
 
 ### Payments — `/api/payments` (feature `invoicing`)
-GET `/?locationId&method&from&to` (`invoices`) · DELETE `/:id` (`billing_admin`; **hard delete**, invoice re-derived).
+GET `/?locationId&method&from&to` (`invoices`; reversals show as negative rows) · DELETE `/:id` and POST `/:id/reverse {reason?}` (`billing_admin`; writes a reversal, never deletes).
 
 ### Expenses — `/api/expenses` (feature `expenses` + permission `expenses`)
-GET `/?locationId&category&from&to` · POST · PATCH · DELETE (hard delete). `amountCents ≥ 1`, no upper limit.
+GET `/?locationId&category&from&to` · POST · PATCH · DELETE (the deleted expense stays in the audit log). `amountCents` 1–1e12.
 
 ### Reports — `/api/reports`
-GET `/dashboard` (team; finance block = `reports` permission **and** `invoicing`; ops include `overstaying`) · GET `/occupancy?days&to` · GET `/finance?from&to` (feature `reports` + permission `reports`; default last 6 calendar months).
+GET `/dashboard` (team; finance block = `reports` permission **and** `invoicing`; ops include `overstaying`) · GET `/occupancy?days&to` · GET `/finance?from&to` and `/finance/charts?from&to` (feature `reports` + permission `reports`; default last 6 calendar months, at most 20 years). See §9.4.
+
+### Audit — `/api/audit` (`billing_admin` or `reports`)
+GET `/?locationId&action&entity&entityId&from&to&limit` — the money audit log, newest first. Read only.
 
 ### Member self-service — `/api/me/summary` (members only)
 Member + location, currency, timezone, today, plan, `meetingMinutes {included: plan minutes + credits × 30, used}`, `amenities` (menu with free per day and used today), `amenityDueCents`, `amenityRequests` (8 newest), `overstay`, open check-in, 5 upcoming confirmed bookings, open invoices + `balanceDueCents` + `overdueCents` (with `invoicing`), expected visitors (with `visitors`).
@@ -518,7 +522,7 @@ Lifecycle `draft → active → ended`, or `draft → cancelled`. Draft editable
 - Members can request amenities (max 10 pending); the front desk serves (records the order) or declines.
 
 ### 8.12 Deleting a member (`services/memberDelete.ts`)
-Only for a member with **no** check-ins, payments, advance/deposit entries, amenity orders, contracts, company contract membership, assignments, visitors, reported problems, or invoices that are not open-and-unpaid. Then, in a transaction, it **hard-deletes** their open unpaid invoices and items, bookings, room/amenity requests, shifts, desks, device links, the member and the user. Otherwise 409: "Cancel their membership instead".
+Only for a member with **no** check-ins, payments, advance/deposit entries, amenity orders, contracts, company contract membership, assignments, visitors, reported problems, or **invoices of any kind** (an issued invoice keeps its number and member for good). Then, in a transaction, it deletes their bookings, room/amenity requests, shifts, desks, device links, the member and the user. Otherwise 409: "Cancel their membership instead".
 
 ### 8.13 Visitors, maintenance, reports
 - Visitors: `expected → checked_in → checked_out`, `expected → cancelled`.
@@ -529,51 +533,101 @@ Only for a member with **no** check-ins, payments, advance/deposit entries, amen
 
 ---
 
-## 9. Finance rules as they behave today
+## 9. Finance rules
 
-This section describes what the code **does**, not what it should do. The `finance-overhaul` branch is fixing these.
+These are the rules as the code implements them on `finance-overhaul` (Stage 1B). The known bugs H1–H6, M1, M3–M6, M9, M10, R1–R4, L3,
+L4, L8, T1 and S1 that Stage 1A recorded are fixed; each has a test in `test/finance-bugs.test.ts` and the reconciliation harness
+(`test/reconciliation.test.ts`) has no known bug left. Decisions that were a matter of policy are listed in 9.6, so they can be changed.
 
-### 9.1 Where money is created and changed
-| Flow | Function | Writes | Transaction |
-|---|---|---|---|
-| Manual invoice | `createInvoice` (`billing.ts`) | invoiceSeq, invoices, items | yes |
-| Monthly invoices | `generateSubscriptionInvoices` | invoices, items, bookings.invoiceId, amenity_orders.invoiceId | yes |
-| Plan period invoice | `startPlanPeriod` / `renewPlan` / `changePlan` → `advanceCredit` + `createInvoice` | invoices, items, members.advanceUsedCents | yes, **except `changePlan` billing** |
-| Amenity invoice | `invoiceAmenities` | invoices, items, amenity_orders.invoiceId | yes |
-| Advance onto an open invoice | `applyToOpenInvoice` | items (−), invoice totals, advanceUsedCents | yes |
-| Payment | `recordPayment` → `recomputeInvoice` | payments, invoice paid/status | yes |
-| Payment removed | `deletePayment` | **hard delete**, recompute | yes |
-| Void | `voidInvoice` | status, frees bookings/amenity orders, restores advance | yes |
-| Invoice deleted | `deleteMember` | **hard delete** of unpaid invoices | yes |
-| Expenses | `routes/expenses.ts` | expenses (**hard delete**) | single statements |
-| Member advance / deposit | `recordMemberMoney`, `settleMemberDeposit` | deposit_entries, members | yes |
-| Contract advance / deposit | `routes/contracts.ts` | deposit_entries, contracts | yes |
-| Amenity given / collected | `giveAmenity` / `collectAmenities` | amenity_orders | yes / **no** |
-| Platform payment | `routes/platform.ts` | platform_payments, organizations | yes |
+### 9.1 Where money is created and changed (all in one transaction, all audited)
+| Flow | Function | Writes |
+|---|---|---|
+| Manual invoice | `createInvoice` (`billing.ts`) | invoiceSeq, invoices, lines (with category), audit |
+| Monthly invoices | `generateSubscriptionInvoices` | invoices per contract and per member, bookings.invoiceId, amenity_orders.invoiceId, advance/credit used |
+| Plan period invoice | `startPlanPeriod`, `renewPlan`, `changePlan` (`planBookings.ts`) | invoices, lines, advance/credit used, voids, credit added |
+| Amenities on an invoice / paid at the desk | `invoiceAmenities`, `collectAmenities` | invoice (+ payment for the desk) |
+| Advance onto an open invoice | `applyToOpenInvoice` (member), `applyContractAdvanceToOpenInvoice` | a negative `advance` line, totals at the invoice's own tax rate |
+| Payment | `recordPayment` | payments, invoice paid/status |
+| Payment taken back | `reversePayment` | a reversal row (negative, dated now), original marked reversed. **Never deleted.** |
+| Void | `voidInvoice` | status; frees bookings and amenity orders; gives back advance (to the contract or member) and credit |
+| Expenses | `routes/expenses.ts` | expenses; a deleted expense stays in the audit log |
+| Advance / deposit | `recordMemberMoney`, `settleMemberDeposit`, `refundMemberAdvance`, contract routes | deposit_entries (`advance`, `advance_refund`, `received`, `refunded`, `kept`) |
+| Platform payment | `routes/platform.ts` | platform_payments, organization period |
+
+`audit_log` (read with `GET /api/audit`, billing controls or reports) records every one of these with who did it. Nothing can edit or
+remove a line.
 
 ### 9.2 Invoices
-- Number `<CODE>-<5 digits>` from the location's counter. Totals: `subtotal = Σ qty × unit`; `tax = round(subtotal × taxRateBps / 10000)` once per invoice; `total = subtotal + tax`. A zero total is created `paid`.
-- `paidCents` and status are always re-derived from the payments (`recomputeInvoice`). Payments can't exceed the balance or go on void/paid invoices. Voiding needs no payments.
-- **Monthly generation** (`generateSubscriptionInvoices`, idempotent per member per month, in one transaction):
-  - Individual members: **active** members overlapping the month who are **not on any company contract (ever)** and have no non-void subscription invoice with `periodStart = <month>-01`. Lines: the plan's monthly price **only if the member has no plan period** (legacy plans), every unbilled priced live booking that started before the month end and before now, and every amenity charge still owed.
-  - Companies: each active/ended company contract overlapping the month gets one invoice to its **current contact** (`contracts.memberId`), skipped if that member already has a subscription invoice for the month: `monthCharges` rent lines + all employees' unbilled bookings + amenities.
-  - Cancelled and paused members are not billed.
-- **Plan shift invoices** are created when a period starts (§8.4), with the advance taken off.
+- Number `<CODE>-<5 digits>`; one invoice per transaction, so a failed invoice leaves no gap. Each invoice stores the **tax rate it was
+  issued at** (`taxRateBps`); `tax = round(subtotal × rate / 10000)` once per invoice. Line categories: `plan`, `booking`, `amenity`,
+  `rent`, `manual`, `advance` (money paid up front), `credit` (money already paid on an earlier invoice); lines carry their space and plan.
+- Limits (`src/lib/money.ts`): a price, rent, deposit or expense up to 10,000,000,000.00; an invoice or payment up to ten times that;
+  a line quantity up to 10,000. Anything that could not be held exactly is a 400.
+- Payments: more than zero, never more than the balance, not on a void or paid invoice; dated no more than 10 minutes ahead and no more
+  than 5 years back. `DELETE /payments/:id` and `POST /payments/:id/reverse {reason}` (billing controls) write a reversal.
+- Void: only with nothing paid (reverse the payments first).
+- **Monthly generation** (idempotent; running it twice bills nothing new):
+  1. one invoice per **contract** running that month (single or company), found by `invoices.contractId`: rent by the day for months it
+     starts or ends in; for a company, the bookings and amenities of the people on it that month; less what is left of the contract's
+     advance;
+  2. one invoice per **member** not on a company contract that month: an old-style plan's price (active members, no plan period), unbilled
+     bookings and amenities (cancelled and paused members too), less their advance, then their credit.
+  **Single-member contract rent is billed by this run.** Tenants who billed it by hand must stop, or it is billed twice.
+- **Plan periods** bill when they start (shift prices, less advance and credit). `changePlan` runs bookings and billing in one transaction:
+  new shifts are billed for the days left; an open unpaid old invoice is voided and its used days billed again; a paid or part-paid one
+  stays and the paid share of its unused days becomes the member's **credit** (`members.creditCents`), taken off the next invoices.
+- Without `invoicing` in the package, plan periods book but do not bill, and amenities cannot be put on an invoice.
 
-### 9.3 Finance report (`financeReport`) and dashboard
-- **Cash basis.** Collected = invoice payments (by `paidAt`) + advances (when received) + kept deposits (when kept) + amenities collected at the desk (by `collectedAt`). Received and refunded deposits are not income. Costs by `incurredOn`. Months are in the location's timezone.
-- Returns totals (invoiced, collected, expenses, net), `monthly` (max 60 months), `previous` period of equal length, `incomeByKind` (`subscription`, `manual`, `kept_deposit`, `advance`, `amenities`), P&L by month, `expensesByCategory`, `paymentsByMethod` (invoice payments only), `receivablesAging` (open invoices as of **now**), `amenities {owedCents, collectedCents, owedBy}`, `deposits {heldCents (all-time, as of now), received, refunded, kept, advance, movements}`.
-- Collected includes tax; there is no tax report. "Invoiced" is net of advance lines while the advance is counted in full as collected.
+### 9.3 Definitions (one place: `src/services/financeCore.ts`, read from `financeBooks.ts`)
+- **Money in (collected)**, cash basis: invoice payments when made (reversals when taken back), advances when received (less advance
+  refunds when paid back), deposits when kept, and amenity charges collected at the desk before desk collections became receipts.
+- **Tax collected**: the tax inside each payment, its share of the invoice's tax on the running total paid, so an invoice paid in full
+  carries exactly its tax.
+- **Income** = money in less tax collected, shared over what was sold: by category (`incomeByCategory`) and in the five kinds the screens
+  draw (`subscription` = plans and rent, `manual` = bookings and other charges, `amenities`, `advance`, `kept_deposit`).
+- **Invoiced (billed)** = invoice totals plus the part an advance paid (credit is not added back: it was billed before).
+- **Outstanding / overdue** now: open invoices' balance (overdue: due before today). **As of a day**: issued by then, less paid by then.
+- **Aging** and **deposits held** in a report are as of the report's end date.
+- **Money in by method** covers everything collected: payment methods, advances by theirs, `kept_deposit`, and `other` for old desk
+  collections; it adds up to money collected.
+- **MRR** (Today): active members' monthly plans (shift prices, or an old-style plan's price) whose period has not lapsed, plus the
+  monthly rent of contracts running today.
 
-### 9.4 KNOWN ISSUES (do not assume these are correct)
-- **H1 — Company contract advance is double-counted.** The advance is income when received, but company invoices are always issued in full; nothing takes the advance off.
-- **H2 — Single-member contract rent is never invoiced.** `contracts.rentCents` (and the contract's advance) never reach an invoice; monthly generation only bills plans, bookings, amenities and company rent.
-- **H3 — Legacy-plan members' advance is never used.** For members without a plan period (`planStart` null), monthly generation bills the plan price but never applies `advanceCredit`, and `applyToOpenInvoice` returns early. They pay the advance and the full invoices.
-- **H4 — Company invoices can be generated twice for a month.** Duplicate detection looks for an invoice to the *current* contact. If the contact changes (the contact leaves) and the month is generated again, the rent is billed again.
-- **H5 — Money records can be erased or backdated without a trace.** Payments and expenses are hard-deleted; payment `paidAt` and invoice dates accept any date; there is no audit log or closed-month lock, so past months' figures can change silently. Deposit/advance entries can't be reversed if entered wrongly.
-- **H6 — Changing plan after paying double-bills, and isn't atomic.** Moving to a different plan (or removing shifts) with a paid invoice gives no credit for the unused period and bills the new plan in full; added shifts are billed for the full period with no proration. The billing runs after the booking transaction, so a failure can leave bookings changed with the old invoice voided and no new one, and `advanceCredit` is a read-then-write outside a transaction.
+### 9.4 Reports
+- `GET /api/reports/finance?from&to` (feature `reports` + permission `reports`; up to 20 years): `totals` (invoiced, collected,
+  taxCollected, income, expenses, net, profit), `monthly`, `previous`, `incomeByKind`, `incomeByCategory`, `profitLoss` (income, tax,
+  costs by month), `expensesByCategory`, `paymentsByMethod`, `asOf`, `receivablesAging`, `amenities`, `unapplied` (advances and credits
+  not yet used), `deposits`.
+- `GET /api/reports/finance/charts?from&to`: month by month billed, collected, collection rate, tax, income by category, money in by
+  method, costs by category, outstanding, overdue and deposits held at each month end; invoices by status, top debtors, income by space,
+  income by plan.
+- `GET /api/reports/dashboard`: the finance block uses the same functions (collected, invoiced, tax this month, outstanding, overdue, MRR).
+- `GET /api/platform/mrr-trend?months` (super admin): money in and earned revenue by month, each payment spread over its months.
 
-Other known risks (medium/low), for the record: cancelled/paused members' last bookings and amenities are never billed, and ex-company employees are never billed individually; desk amenity collection has no payment record and runs outside a transaction; advances and deposit refunds only need the `members` permission (in the front-desk preset); plan and amenity invoices ignore the `invoicing` feature; `deleteMember` hard-deletes issued invoices; MRR leaves out contract rent and counts lapsed plan periods; company price changes apply to the whole current month; unused advance can't be refunded and isn't reported; `PATCH /members` can change `planId` without re-billing; `no_show` bookings are never charged; the report's 60-month cap doesn't apply to totals; aging and deposits held are "as of now"; `paymentsByMethod` doesn't reconcile with collected; several amounts have no upper limit (manual invoice unit price, expense amount); platform payments can't be corrected; platform currency is fixed to PKR.
+### 9.5 Permissions for money
+- Taking money (advance, deposit, starting/changing/renewing a plan that bills): `invoices` (as well as `members`).
+- Giving money back or keeping it (deposit refund or forfeit, advance refund), reversing payments, voiding, generating: `billing_admin`.
+- Another tenant's or location's record ids answer **404**, exactly like ids that do not exist.
+
+### 9.6 Policy decisions made in Stage 1B (change here if the business wants otherwise)
+| Topic | Decision |
+|---|---|
+| Removing a payment | Reversal row; the original stays (H5a) |
+| Payment dates | Not in the future (10 minutes' leeway), not more than 5 years back |
+| Changing plan after paying | The paid share of unused days becomes credit for the next invoices |
+| Paused / cancelled members | Billed for completed bookings and amenities they had, never for a plan |
+| Desk amenity collection | A receipt (invoice + payment), taxed like every invoice |
+| Deleting a member | Refused once they have any invoice: void and cancel instead |
+| Tax on advances | An advance carries no tax when received; invoices are taxed on what is left after it |
+| Single-member contract rent | Billed by the monthly run, by the day for part months |
+| No-show bookings | Not charged (unchanged) |
+| Report range | Up to 20 years |
+
+### 9.7 Still open (not money-moving bugs, recorded for later)
+- Company contract price changes apply to the whole month of the next invoice (no effective date).
+- Platform payments cannot be corrected once recorded (the amount is not checked against the package price).
+- Platform currency is fixed to PKR.
+- The login throttle is per server instance.
 
 ---
 
@@ -597,7 +651,7 @@ Other known risks (medium/low), for the record: cancelled/paused members' last b
 - Passwords bcrypt cost 10; login timing equalised; throttled (per instance).
 - Photo uploads magic-byte checked; served with nosniff.
 - Health endpoint hides failure reasons. `trust proxy = 1`.
-- Finance-specific weaknesses are listed in §9.4.
+- Money permissions and record ids: §9.5. Every money change is in the audit log (§9.1).
 
 ---
 
@@ -618,9 +672,9 @@ Seeded packages: **Starter** (PKR 7,500/mo; visitors; 1 location, 40 members), *
 ---
 
 ## 13. Tests (`test/`)
-33 suites, 292 tests (all passing; typecheck clean). Suites: admin, amenities, auth, billing, bookings, bookingsList, checkin-rules, checkinPlan, companyContracts, contractPricing, contracts, deposits, devices, **financeIntegrity** (checks every invoice, payment, report and dashboard figure agree through a full sequence of money movements), floorplan, floors, flows, frontdesk, health, performance, permissions, planMembers, platform, portalFixes, pricingTab, reports, roomRequests, security, shifts, spaces, tenancy, time, usecases. `test/helpers.ts` builds in-memory DBs and signed-in agents. Run `npm test` and `npm run typecheck`.
+39 suites, 367 tests (all passing; typecheck clean). Finance: `finance-bugs` (one test per fixed bug), `finance-coverage`, `finance-billing`, `finance-audit`, `finance-charts`, `financeCore` (endpoints equal the shared definitions), `reconciliation` (one scenario, every money screen against the raw rows; helpers in `test/helpers/`). Suites: admin, amenities, auth, billing, bookings, bookingsList, checkin-rules, checkinPlan, companyContracts, contractPricing, contracts, deposits, devices, **financeIntegrity** (checks every invoice, payment, report and dashboard figure agree through a full sequence of money movements), floorplan, floors, flows, frontdesk, health, performance, permissions, planMembers, platform, portalFixes, pricingTab, reports, roomRequests, security, shifts, spaces, tenancy, time, usecases. `test/helpers.ts` builds in-memory DBs and signed-in agents. Run `npm test` and `npm run typecheck`.
 
-Not yet covered: the §9.4 issues (H1–H6), cancelled/paused members' final charges, tax rate changing after issue, finance report month boundaries in a non-UTC timezone, cross-tenant IDs on payments/expenses/deposits, very large amounts, future/backdated `paidAt`, amenity invoices without `invoicing`, and concurrency outside transactions.
+Concurrency tests use a file database (`setup(url)`): an in-memory libsql database has a single connection.
 
 ---
 
