@@ -139,7 +139,7 @@ export function invoicesRouter(db: Db) {
     const body = parse(
       z.object({
         amountCents: paymentAmount,
-        method: z.enum(PAYMENT_METHODS),
+        method: z.enum(PAYMENT_METHODS).default('cash'),
         paidAt: z.iso.datetime().optional(),
         reference: z.string().trim().max(200).default(''),
         notes: z.string().trim().max(500).default(''),

@@ -1,4 +1,6 @@
 import { Router } from 'express';
+import { CHANNELS, type Channel } from '../services/financeCore.js';
+import { channelBook } from '../services/financeDesk.js';
 import { requireLocationId } from '../lib/access.js';
 import { hasFeature, requireFeature } from '../lib/auth.js';
 import { can, requirePermission } from '../lib/permissions.js';
@@ -47,6 +49,13 @@ export function reportsRouter(db: Db) {
 
   r.get('/finance', requireFeature('reports'), requirePermission('reports'), async (req, res) => {
     res.json(await financeReport(db, await rangeOf(req)));
+  });
+
+  /** One channel's book for the range: cash, card, bank_transfer (online transfer) or cheque. */
+  r.get('/finance/channel', requireFeature('reports'), requirePermission('reports'), async (req, res) => {
+    const method = queryString(req, 'method');
+    if (!method || !(CHANNELS as readonly string[]).includes(method)) throw badRequest(`method must be one of ${CHANNELS.join(', ')}`);
+    res.json(await channelBook(db, { ...(await rangeOf(req)), method: method as Channel }));
   });
 
   r.get('/finance/charts', requireFeature('reports'), requirePermission('reports'), async (req, res) => {

@@ -130,14 +130,14 @@ export async function createInvoice(db: DbLike, input: NewInvoice): Promise<Invo
 
 const orgOf = async (db: DbLike, locationId: string) => (await db.select({ o: locations.organizationId }).from(locations).where(eq(locations.id, locationId)).get())?.o ?? null;
 
-/** Re-derives paidCents and status from the payments ledger. */
+/** Re-derives paidCents and status from the payments ledger. Only cleared money counts: a cheque waiting to clear does not pay anything. */
 export async function recomputeInvoice(db: DbLike, invoiceId: string): Promise<Invoice> {
   const inv = await db.select().from(invoices).where(eq(invoices.id, invoiceId)).get();
   if (!inv) throw notFound('Invoice');
   const { paid } = (await db
     .select({ paid: sql<number>`coalesce(sum(${payments.amountCents}), 0)` })
     .from(payments)
-    .where(eq(payments.invoiceId, invoiceId))
+    .where(and(eq(payments.invoiceId, invoiceId), eq(payments.status, 'cleared')))
     .get())!;
   const status = inv.status === 'void' ? 'void' : paid >= inv.totalCents ? 'paid' : 'open';
   return db.update(invoices).set({ paidCents: paid, status }).where(eq(invoices.id, invoiceId)).returning().get();
@@ -159,16 +159,20 @@ export function recordPayment(
     const inv = await tx.select().from(invoices).where(eq(invoices.id, p.invoiceId)).get();
     if (!inv) throw notFound('Invoice');
     if (inv.status === 'void') throw conflict('This invoice is void');
-    const balance = inv.totalCents - inv.paidCents;
-    if (balance <= 0) throw conflict('This invoice is already paid');
+    const waiting = await pendingChequesCents(tx, inv.id);
+    const balance = inv.totalCents - inv.paidCents - waiting;
+    if (inv.totalCents - inv.paidCents <= 0) throw conflict('This invoice is already paid');
+    if (balance <= 0) throw conflict('A cheque for the rest of this invoice is waiting to clear');
     if (p.amountCents > balance) throw badRequest(`Payment exceeds the balance due (${balance} cents)`);
 
+    // A cheque counts only once it clears; everything else has arrived.
+    const cheque = p.method === 'cheque';
     const payment = await tx
       .insert(payments)
-      .values({ ...p, locationId: inv.locationId, memberId: inv.memberId })
+      .values({ ...p, locationId: inv.locationId, memberId: inv.memberId, status: cheque ? 'pending' : 'cleared', clearedAt: cheque ? null : p.paidAt })
       .returning()
       .get();
-    await audit(tx, { organizationId: await orgOf(tx, inv.locationId), locationId: inv.locationId, actorId: p.recordedById, action: 'payment.record', entity: 'payment', entityId: payment.id, amountCents: payment.amountCents, data: { invoiceId: inv.id, number: inv.number, method: p.method, paidAt: p.paidAt, reference: p.reference } });
+    await audit(tx, { organizationId: await orgOf(tx, inv.locationId), locationId: inv.locationId, actorId: p.recordedById, action: 'payment.record', entity: 'payment', entityId: payment.id, amountCents: payment.amountCents, data: { invoiceId: inv.id, number: inv.number, method: p.method, paidAt: p.paidAt, reference: p.reference, status: payment.status } });
     return { payment, invoice: await recomputeInvoice(tx, inv.id) };
   });
 }
@@ -183,6 +187,8 @@ export function reversePayment(db: Db, paymentId: string, actorId: string, reaso
     if (!pay) throw notFound('Payment');
     if (pay.reversesPaymentId) throw conflict('This is a reversal; it cannot be reversed itself');
     if (pay.reversedAt) throw conflict('This payment was already reversed');
+    if (pay.status === 'pending') throw conflict('This cheque has not cleared yet. Mark it bounced instead');
+    if (pay.status === 'bounced') throw conflict('This cheque bounced, so there is nothing to take back');
     const now = new Date().toISOString();
     const reversal = await tx
       .insert(payments)
@@ -197,11 +203,52 @@ export function reversePayment(db: Db, paymentId: string, actorId: string, reaso
         notes: reason || 'Payment reversed',
         recordedById: actorId,
         reversesPaymentId: pay.id,
+        clearedAt: now,
       })
       .returning()
       .get();
     await tx.update(payments).set({ reversedAt: now, reversedById: actorId }).where(eq(payments.id, pay.id)).run();
     await audit(tx, { organizationId: await orgOf(tx, pay.locationId), locationId: pay.locationId, actorId, action: 'payment.reverse', entity: 'payment', entityId: pay.id, amountCents: pay.amountCents, data: { reversalId: reversal.id, invoiceId: pay.invoiceId, method: pay.method, paidAt: pay.paidAt, reason } });
+    return recomputeInvoice(tx, pay.invoiceId);
+  });
+}
+
+/** What the cheques on an invoice that have not cleared yet come to. They hold that part of the balance until they clear or bounce. */
+export async function pendingChequesCents(db: DbLike, invoiceId: string) {
+  const row = await db
+    .select({ v: sql<number>`coalesce(sum(${payments.amountCents}), 0)` })
+    .from(payments)
+    .where(and(eq(payments.invoiceId, invoiceId), eq(payments.status, 'pending')))
+    .get();
+  return row?.v ?? 0;
+}
+
+/**
+ * A cheque on an invoice cleared: from now it pays the invoice, and the books count the money on the day it cleared (`clearedAt`,
+ * not before the cheque was received and not in the future).
+ */
+export function clearPayment(db: Db, paymentId: string, actorId: string, clearedAt: string) {
+  return db.transaction(async (tx) => {
+    const pay = await tx.select().from(payments).where(eq(payments.id, paymentId)).get();
+    if (!pay) throw notFound('Payment');
+    if (pay.status !== 'pending') throw conflict(pay.status === 'cleared' ? 'This cheque has already cleared' : 'This cheque bounced');
+    if (clearedAt.slice(0, 10) < pay.paidAt.slice(0, 10)) throw badRequest('A cheque cannot clear before it was received');
+    if (clearedAt < pay.paidAt) clearedAt = pay.paidAt;
+    await tx.update(payments).set({ status: 'cleared', clearedAt }).where(eq(payments.id, pay.id)).run();
+    await audit(tx, { organizationId: await orgOf(tx, pay.locationId), locationId: pay.locationId, actorId, action: 'cheque.clear', entity: 'payment', entityId: pay.id, amountCents: pay.amountCents, data: { invoiceId: pay.invoiceId, reference: pay.reference, clearedAt } });
+    return recomputeInvoice(tx, pay.invoiceId);
+  });
+}
+
+/** A cheque on an invoice bounced: it never paid anything, so the invoice stays open for the full balance. */
+export function bouncePayment(db: Db, paymentId: string, actorId: string, reason = '') {
+  return db.transaction(async (tx) => {
+    const pay = await tx.select().from(payments).where(eq(payments.id, paymentId)).get();
+    if (!pay) throw notFound('Payment');
+    if (pay.status !== 'pending') throw conflict(pay.status === 'cleared' ? 'This cheque has already cleared. Reverse the payment instead' : 'This cheque already bounced');
+    const now = new Date().toISOString();
+    await tx.update(payments).set({ status: 'bounced', bouncedAt: now, notes: reason ? `${pay.notes ? `${pay.notes}. ` : ''}Bounced: ${reason}` : pay.notes }).where(eq(payments.id, pay.id)).run();
+    await audit(tx, { organizationId: await orgOf(tx, pay.locationId), locationId: pay.locationId, actorId, action: 'cheque.bounce', entity: 'payment', entityId: pay.id, amountCents: pay.amountCents, data: { invoiceId: pay.invoiceId, reference: pay.reference, reason } });
     return recomputeInvoice(tx, pay.invoiceId);
   });
 }
@@ -227,6 +274,7 @@ export function voidInvoice(db: DbLike, invoiceId: string, actorId?: string) {
     if (!inv) throw notFound('Invoice');
     if (inv.status === 'void') throw conflict('Invoice is already void');
     if (inv.paidCents > 0) throw conflict('Reverse the payments on this invoice before voiding it');
+    if ((await pendingChequesCents(tx, inv.id)) > 0) throw conflict('A cheque on this invoice is waiting to clear. Mark it cleared or bounced first');
     // Release bookings and amenities so they can be billed on a replacement invoice.
     await tx.update(bookings).set({ invoiceId: null }).where(eq(bookings.invoiceId, inv.id)).run();
     await tx.update(amenityOrders).set({ invoiceId: null }).where(eq(amenityOrders.invoiceId, inv.id)).run();

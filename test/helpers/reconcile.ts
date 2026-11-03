@@ -67,14 +67,14 @@ export async function buildReconciliationScenario(ctx: Ctx): Promise<Scenario> {
   // Payments a minute either side of midnight at the month end.
   const manual = await manualInvoice(owner, ctx.basic.member.id, 3_000); // 3,300
   await pay(manual.id, 1_000, at(prevLast, '23:59'));
-  await pay(manual.id, 1_000, at(`${t.slice(0, 7)}-01`, '00:01'), 'jazzcash');
+  await pay(manual.id, 1_000, at(`${t.slice(0, 7)}-01`, '00:01'), 'card');
 
   // An invoice that is overdue and untouched.
   await manualInvoice(owner, ctx.pro.member.id, 7_000, { issueDate: `${prev}-01`, dueDate: `${prev}-05` });
 
   // A plan member whose advance comes off the shift invoice, then a part payment.
   const p = await planWithShifts(ctx, owner, 'Recon');
-  const planned = await planMember(ctx, owner, p, { advanceCents: 200_000, method: 'easypaisa' });
+  const planned = await planMember(ctx, owner, p, { advanceCents: 200_000, method: 'bank_transfer' });
   const planBill = (await ctx.db.select().from(invoices).where(eq(invoices.memberId, planned.id)).all())[0]!;
   await pay(planBill.id, 100_000);
 

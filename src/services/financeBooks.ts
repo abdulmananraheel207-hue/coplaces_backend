@@ -1,10 +1,11 @@
-import { and, eq, gt, inArray, isNotNull, isNull } from 'drizzle-orm';
+import { and, eq, gt, inArray, isNotNull, isNull, sql } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import { amenityOrders, contracts, depositEntries, invoiceItems, invoices, members, payments } from '../db/schema.js';
 import type { Books } from './financeCore.js';
 
 /**
- * Reads a location's books: every invoice with its lines, every payment and reversal, the advance and deposit ledger, and the amenity
+ * Reads a location's books. Only money that has arrived is in them: a cheque counts once it clears, dated the day it cleared, and a
+ * bounced cheque never. Reads a location's books: every invoice with its lines, every payment and reversal, the advance and deposit ledger, and the amenity
  * charges that were collected at the desk without an invoice. Four reads, whatever the size of the period, so the report, the Today
  * page and the charts all compute from the same rows with the same functions (financeCore.ts).
  */
@@ -17,8 +18,16 @@ export async function loadBooks(db: Db, locationId: string): Promise<Books> {
       .innerJoin(invoices, eq(invoices.id, invoiceItems.invoiceId))
       .where(eq(invoices.locationId, locationId))
       .all(),
-    db.select({ id: payments.id, invoiceId: payments.invoiceId, amountCents: payments.amountCents, method: payments.method, paidAt: payments.paidAt, createdAt: payments.createdAt }).from(payments).where(eq(payments.locationId, locationId)).all(),
-    db.select({ kind: depositEntries.kind, amountCents: depositEntries.amountCents, occurredAt: depositEntries.occurredAt, method: depositEntries.method }).from(depositEntries).where(eq(depositEntries.locationId, locationId)).all(),
+    db
+      .select({ id: payments.id, invoiceId: payments.invoiceId, amountCents: payments.amountCents, method: payments.method, paidAt: sql<string>`coalesce(${payments.clearedAt}, ${payments.paidAt})`, createdAt: payments.createdAt })
+      .from(payments)
+      .where(and(eq(payments.locationId, locationId), eq(payments.status, 'cleared')))
+      .all(),
+    db
+      .select({ kind: depositEntries.kind, amountCents: depositEntries.amountCents, occurredAt: sql<string>`coalesce(${depositEntries.clearedAt}, ${depositEntries.occurredAt})`, method: depositEntries.method })
+      .from(depositEntries)
+      .where(and(eq(depositEntries.locationId, locationId), eq(depositEntries.status, 'cleared')))
+      .all(),
     db
       .select({ chargeCents: amenityOrders.chargeCents, collectedAt: amenityOrders.collectedAt, invoiceId: amenityOrders.invoiceId })
       .from(amenityOrders)

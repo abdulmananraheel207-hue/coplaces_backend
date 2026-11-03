@@ -8,6 +8,7 @@ import { addDays, daysBetween, todayIn } from '../lib/time.js';
 import { loadLocation } from '../lib/access.js';
 import { creditOpenInvoice } from './billing.js';
 import { audit } from './audit.js';
+import { pendingEntry } from './cheques.js';
 
 /**
  * A member's advance and security deposit.
@@ -31,16 +32,17 @@ const SETTLE_DAYS_BEFORE = 2;
 const ACTIONS = { advance: 'advance.receive', advance_refund: 'advance.refund', received: 'deposit.receive', refunded: 'deposit.refund', kept: 'deposit.keep' } as const;
 
 /** One movement of a member's money: written to the ledger the reports read, and to the audit log. */
-async function entry(t: Db, actor: AuthUser, member: { id: string; locationId: string }, kind: 'advance' | 'advance_refund' | 'received' | 'refunded' | 'kept', amountCents: number, method: Method | null, reference: string) {
-  await t.insert(depositEntries).values({ locationId: member.locationId, memberId: member.id, kind, amountCents, method, reference, occurredAt: new Date().toISOString(), recordedById: actor.id }).run();
-  await audit(t, { organizationId: actor.organizationId, locationId: member.locationId, actorId: actor.id, action: ACTIONS[kind], entity: 'member', entityId: member.id, amountCents, data: { method, reference } });
+async function entry(t: Db, actor: AuthUser, member: { id: string; locationId: string }, kind: 'advance' | 'advance_refund' | 'received' | 'refunded' | 'kept', amountCents: number, method: Method | null, reference: string, status: 'cleared' | 'pending' = 'cleared') {
+  const now = new Date().toISOString();
+  await t.insert(depositEntries).values({ locationId: member.locationId, memberId: member.id, kind, amountCents, method, reference, occurredAt: now, recordedById: actor.id, status, clearedAt: status === 'cleared' ? now : null }).run();
+  await audit(t, { organizationId: actor.organizationId, locationId: member.locationId, actorId: actor.id, action: ACTIONS[kind], entity: 'member', entityId: member.id, amountCents, data: { method, reference, status } });
 }
 
 /**
  * Takes what is left of a member's advance off their newest invoice that is still open and unpaid: the invoice of the current plan
  * period for a member with shifts, otherwise their newest monthly invoice. The invoice keeps the tax rate it was issued at.
  */
-async function applyToOpenInvoice(t: Db, memberId: string) {
+export async function applyToOpenInvoice(t: Db, memberId: string) {
   const m = (await t.select().from(members).where(eq(members.id, memberId)).get())!;
   const left = m.advanceCents - m.advanceUsedCents;
   if (left <= 0) return;
@@ -71,17 +73,25 @@ export async function recordMemberMoney(t: Db, actor: AuthUser, memberId: string
   const advance = input.advanceCents ?? 0;
   const deposit = input.depositCents ?? 0;
   if (advance < 0 || deposit < 0) throw badRequest('Amounts cannot be negative');
+  // A cheque is only written down as pending: the advance and the deposit are taken when it clears (see cheques.ts).
+  const cheque = input.method === 'cheque';
   if (advance > 0) {
     if (member.advanceReceivedAt) throw conflict('The advance was already received, so it cannot be added again');
-    await entry(t, actor, member, 'advance', advance, input.method, input.reference);
-    await t.update(members).set({ advanceCents: advance, advanceReceivedAt: new Date().toISOString() }).where(eq(members.id, member.id)).run();
+    if (await pendingEntry(t, { memberId: member.id }, 'advance')) throw conflict('A cheque for the advance is waiting to clear');
   }
   if (deposit > 0) {
     if (member.depositStatus !== 'pending') throw conflict('The security deposit was already received');
-    await entry(t, actor, member, 'received', deposit, input.method, input.reference);
-    await t.update(members).set({ depositCents: deposit, depositStatus: 'held' }).where(eq(members.id, member.id)).run();
+    if (await pendingEntry(t, { memberId: member.id }, 'received')) throw conflict('A cheque for the security deposit is waiting to clear');
   }
-  if (advance > 0) await applyToOpenInvoice(t, member.id);
+  if (advance > 0) {
+    await entry(t, actor, member, 'advance', advance, input.method, input.reference, cheque ? 'pending' : 'cleared');
+    if (!cheque) await t.update(members).set({ advanceCents: advance, advanceReceivedAt: new Date().toISOString() }).where(eq(members.id, member.id)).run();
+  }
+  if (deposit > 0) {
+    await entry(t, actor, member, 'received', deposit, input.method, input.reference, cheque ? 'pending' : 'cleared');
+    if (!cheque) await t.update(members).set({ depositCents: deposit, depositStatus: 'held' }).where(eq(members.id, member.id)).run();
+  }
+  if (advance > 0 && !cheque) await applyToOpenInvoice(t, member.id);
 }
 
 /**

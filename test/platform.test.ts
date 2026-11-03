@@ -142,7 +142,7 @@ describe('subscription payments', () => {
 
     const paid = await root
       .post(`/api/platform/organizations/${space.body.id}/payments`)
-      .send({ amountCents: 4_500_000, method: 'jazzcash', reference: 'TXN-1', periods: 2 })
+      .send({ amountCents: 4_500_000, method: 'bank_transfer', reference: 'TXN-1', periods: 2 })
       .expect(201);
     // the trial runs to day 14, so two paid months start there
     expect(paid.body.payment.periodStart).toBe(trialEnds);

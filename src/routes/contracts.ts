@@ -13,6 +13,7 @@ import { parse } from '../lib/validate.js';
 import { money } from '../lib/money.js';
 import { audit } from '../services/audit.js';
 import { applyContractAdvanceToOpenInvoice } from '../services/billing.js';
+import { pendingEntry } from '../services/cheques.js';
 import { addPerson, createCompanyContract, discardCompanyDraft, extendContract, refreshRent, removePerson, setContractSpaces } from '../services/companyContracts.js';
 import { monthCharges, monthlyTotal } from '../services/contractPricing.js';
 import { activateContract, endContract } from '../services/contracts.js';
@@ -188,6 +189,8 @@ export function contractsRouter(db: Db) {
     if (c.status === 'ended' || c.status === 'cancelled') throw conflict(`This contract is ${c.status}`);
     if (c.status !== 'draft' && (body.startDate !== undefined || body.endDate !== undefined)) throw conflict('Dates can only be changed on a draft. Use Extend to move the end of a running contract.');
     if (c.advanceReceivedAt && body.advanceCents !== undefined && body.advanceCents !== c.advanceCents) throw conflict('The advance was already received, so its amount cannot change');
+    if (body.advanceCents !== undefined && body.advanceCents !== c.advanceCents && (await pendingEntry(db, { contractId: c.id }, 'advance'))) throw conflict('A cheque for the advance is waiting to clear, so its amount cannot change');
+    if (body.depositCents !== undefined && body.depositCents !== c.depositCents && (await pendingEntry(db, { contractId: c.id }, 'received'))) throw conflict('A cheque for the security deposit is waiting to clear, so its amount cannot change');
     if (c.depositStatus !== 'pending' && body.depositCents !== undefined && body.depositCents !== c.depositCents) throw conflict('The security deposit was already received, so its amount cannot change');
     const next = { ...c, ...body };
     if (next.endDate && next.endDate < next.startDate) throw badRequest('End date is before start date');
@@ -238,6 +241,8 @@ export function contractsRouter(db: Db) {
     if (c.status !== 'draft' && Object.keys(body).some((k) => k !== 'notes')) throw conflict('Only the notes can be changed once a contract has started');
     // Money already taken cannot be rewritten; the ledger would no longer match the contract.
     if (c.advanceReceivedAt && body.advanceCents !== undefined && body.advanceCents !== c.advanceCents) throw conflict('The advance was already received, so its amount cannot change');
+    if (body.advanceCents !== undefined && body.advanceCents !== c.advanceCents && (await pendingEntry(db, { contractId: c.id }, 'advance'))) throw conflict('A cheque for the advance is waiting to clear, so its amount cannot change');
+    if (body.depositCents !== undefined && body.depositCents !== c.depositCents && (await pendingEntry(db, { contractId: c.id }, 'received'))) throw conflict('A cheque for the security deposit is waiting to clear, so its amount cannot change');
     if (c.depositStatus !== 'pending' && body.depositCents !== undefined && body.depositCents !== c.depositCents) throw conflict('The security deposit was already received, so its amount cannot change');
     const next = { ...c, ...body };
     if (next.endDate && next.endDate < next.startDate) throw badRequest('End date is before start date');
@@ -265,6 +270,7 @@ export function contractsRouter(db: Db) {
       return;
     }
     if (c.advanceReceivedAt || c.depositStatus !== 'pending') throw conflict('Money was already received on this contract. Start and end it instead, then settle the security deposit.');
+    if ((await pendingEntry(db, { contractId: c.id }, 'advance')) || (await pendingEntry(db, { contractId: c.id }, 'received'))) throw conflict('A cheque on this contract is waiting to clear. Mark it cleared or bounced first.');
     res.json(await db.update(contracts).set({ status: 'cancelled' }).where(eq(contracts.id, c.id)).returning().get());
   });
 
@@ -287,11 +293,15 @@ export function contractsRouter(db: Db) {
       if (c.advanceCents <= 0) throw badRequest('This contract has no advance');
       if (c.advanceReceivedAt) throw conflict('The advance was already received');
       if (c.status === 'cancelled') throw conflict('This contract was cancelled');
+      if (await pendingEntry(tx, { contractId: c.id }, 'advance')) throw conflict('A cheque for the advance is waiting to clear');
       const now = new Date().toISOString();
+      // A cheque is only written down as pending; the advance is taken when it clears (see cheques.ts).
+      const cheque = body.method === 'cheque';
       await tx.insert(depositEntries)
-        .values({ locationId: c.locationId, contractId: c.id, kind: 'advance', amountCents: c.advanceCents, method: body.method, reference: body.reference, occurredAt: now, recordedById: user.id })
+        .values({ locationId: c.locationId, contractId: c.id, kind: 'advance', amountCents: c.advanceCents, method: body.method, reference: body.reference, occurredAt: now, recordedById: user.id, status: cheque ? 'pending' : 'cleared', clearedAt: cheque ? null : now })
         .run();
-      await audit(tx, { organizationId: user.organizationId, locationId: c.locationId, actorId: user.id, action: 'advance.receive', entity: 'contract', entityId: c.id, amountCents: c.advanceCents, data: { method: body.method, reference: body.reference } });
+      await audit(tx, { organizationId: user.organizationId, locationId: c.locationId, actorId: user.id, action: 'advance.receive', entity: 'contract', entityId: c.id, amountCents: c.advanceCents, data: { method: body.method, reference: body.reference, status: cheque ? 'pending' : 'cleared' } });
+      if (cheque) return tx.select().from(contracts).where(eq(contracts.id, c.id)).get();
       await tx.update(contracts).set({ advanceReceivedAt: now }).where(eq(contracts.id, c.id)).run();
       // Received after the contract's invoice was made: it comes off that invoice now.
       await applyContractAdvanceToOpenInvoice(tx, c.id);
@@ -339,10 +349,10 @@ export function contractsRouter(db: Db) {
       if (!c) throw notFound('Contract');
       assertSees(user, c.locationId, 'Contract');
       const now = new Date().toISOString();
-      const entry = async (kind: 'received' | 'refunded' | 'kept', amountCents: number) => {
+      const entry = async (kind: 'received' | 'refunded' | 'kept', amountCents: number, status: 'cleared' | 'pending' = 'cleared') => {
         await tx
           .insert(depositEntries)
-          .values({ locationId: c.locationId, contractId: c.id, kind, amountCents, method: kind === 'kept' ? null : body.method, reference: body.reference, occurredAt: now, recordedById: user.id })
+          .values({ locationId: c.locationId, contractId: c.id, kind, amountCents, method: kind === 'kept' ? null : body.method, reference: body.reference, occurredAt: now, recordedById: user.id, status, clearedAt: status === 'cleared' ? now : null })
           .run();
         const action = kind === 'received' ? 'deposit.receive' : kind === 'refunded' ? 'deposit.refund' : 'deposit.keep';
         await audit(tx, { organizationId: user.organizationId, locationId: c.locationId, actorId: user.id, action, entity: 'contract', entityId: c.id, amountCents, data: { method: kind === 'kept' ? null : body.method, reference: body.reference } });
@@ -350,6 +360,12 @@ export function contractsRouter(db: Db) {
       if (body.action === 'receive') {
         if (c.depositCents <= 0) throw badRequest('This contract has no security deposit');
         if (c.depositStatus !== 'pending') throw conflict('The security deposit was already received');
+        if (await pendingEntry(tx, { contractId: c.id }, 'received')) throw conflict('A cheque for the security deposit is waiting to clear');
+        // A cheque is held as pending; the deposit is held once it clears (see cheques.ts).
+        if (body.method === 'cheque') {
+          await entry('received', c.depositCents, 'pending');
+          return tx.select().from(contracts).where(eq(contracts.id, c.id)).get();
+        }
         await entry('received', c.depositCents);
         return tx.update(contracts).set({ depositStatus: 'held' }).where(eq(contracts.id, c.id)).returning().get();
       }

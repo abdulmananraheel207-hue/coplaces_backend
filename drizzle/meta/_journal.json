@@ -148,6 +148,20 @@
       "when": 1793698827462,
       "tag": "0020_credit_hours_per_room",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "6",
+      "when": 1793733745007,
+      "tag": "0021_channels_and_cheques",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "6",
+      "when": 1793736995775,
+      "tag": "0022_business_logo",
+      "breakpoints": true
     }
   ]
 }

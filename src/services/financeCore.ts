@@ -314,12 +314,12 @@ export function incomeEntries(b: Books, w: InstantWindow): IncomeEntry[] {
   }
   for (const e of b.ledger) {
     if (!inWindow(e.occurredAt, w)) continue;
-    if (e.kind === 'advance') out.push({ at: e.occurredAt, amountCents: e.amountCents, category: 'advance', method: e.method ?? 'other', resourceId: null, planId: null });
-    if (e.kind === 'advance_refund') out.push({ at: e.occurredAt, amountCents: -e.amountCents, category: 'advance', method: e.method ?? 'other', resourceId: null, planId: null });
+    if (e.kind === 'advance') out.push({ at: e.occurredAt, amountCents: e.amountCents, category: 'advance', method: e.method ?? 'cash', resourceId: null, planId: null });
+    if (e.kind === 'advance_refund') out.push({ at: e.occurredAt, amountCents: -e.amountCents, category: 'advance', method: e.method ?? 'cash', resourceId: null, planId: null });
     if (e.kind === 'kept') out.push({ at: e.occurredAt, amountCents: e.amountCents, category: 'kept_deposit', method: 'kept_deposit', resourceId: null, planId: null });
   }
   for (const o of b.amenityOrders) {
-    if (o.chargeCents > 0 && o.collectedAt && !o.invoiceId && inWindow(o.collectedAt, w)) out.push({ at: o.collectedAt, amountCents: o.chargeCents, category: 'amenity', method: 'other', resourceId: null, planId: null });
+    if (o.chargeCents > 0 && o.collectedAt && !o.invoiceId && inWindow(o.collectedAt, w)) out.push({ at: o.collectedAt, amountCents: o.chargeCents, category: 'amenity', method: 'cash', resourceId: null, planId: null });
   }
   return out;
 }
@@ -340,11 +340,11 @@ export function moneyInByMethod(b: Books, w: InstantWindow) {
   for (const p of b.payments) if (inWindow(p.paidAt, w)) add(p.method, p.amountCents);
   for (const e of b.ledger) {
     if (!inWindow(e.occurredAt, w)) continue;
-    if (e.kind === 'advance') add(e.method ?? 'other', e.amountCents);
-    if (e.kind === 'advance_refund') add(e.method ?? 'other', -e.amountCents);
+    if (e.kind === 'advance') add(e.method ?? 'cash', e.amountCents);
+    if (e.kind === 'advance_refund') add(e.method ?? 'cash', -e.amountCents);
     if (e.kind === 'kept') add('kept_deposit', e.amountCents);
   }
-  for (const o of b.amenityOrders) if (o.chargeCents > 0 && o.collectedAt && !o.invoiceId && inWindow(o.collectedAt, w)) add('other', o.chargeCents);
+  for (const o of b.amenityOrders) if (o.chargeCents > 0 && o.collectedAt && !o.invoiceId && inWindow(o.collectedAt, w)) add('cash', o.chargeCents);
   return [...by.entries()].filter(([, cents]) => cents !== 0).map(([method, amountCents]) => ({ method, amountCents })).sort((x, y) => y.amountCents - x.amountCents || x.method.localeCompare(y.method));
 }
 
@@ -377,4 +377,99 @@ export function invoicesByStatus(invoices: InvoiceRow[], days: DayRange, today: 
     void: { ...row(issued.filter((i) => i.status === 'void')), owedCents: 0 },
     overdue: row(issued.filter((i) => i.status === 'open' && i.dueDate < today)),
   };
+}
+
+// ---- Channels: how money moved, and what is in the till and the bank ------------------------------------------------------------
+
+/** The four ways money moves. Cash is the till; card, online transfer and cleared cheques land in the bank. */
+export const CHANNELS = ['cash', 'card', 'bank_transfer', 'cheque'] as const;
+export type Channel = (typeof CHANNELS)[number];
+export const BANK_CHANNELS: Channel[] = ['card', 'bank_transfer', 'cheque'];
+
+export interface ExpenseRow {
+  amountCents: number;
+  method: string;
+  incurredOn: string;
+}
+
+export interface ChannelFlow {
+  method: Channel;
+  /** Money received for what was sold: invoice payments, advances, old desk amenity cash. */
+  salesInCents: number;
+  /** Security deposits received: in the till or the bank, but held for the member (a liability, not income). */
+  depositsInCents: number;
+  /** Money given back: payment reversals, advance refunds, deposit refunds. */
+  refundsOutCents: number;
+  /** Expenses paid through this channel. */
+  expensesOutCents: number;
+  /** In less out. */
+  netCents: number;
+}
+
+const asChannel = (m: string | null | undefined): Channel => ((CHANNELS as readonly string[]).includes(m ?? '') ? (m as Channel) : 'cash');
+
+/**
+ * Money in and out of each channel for instants in [start, end) and expense days in `days`. Kept deposits move no money (it came in
+ * when the deposit was received), so they are in no channel. Pending and bounced cheques are not in the books at all.
+ */
+export function channelFlows(b: Books, expenses: ExpenseRow[], w: InstantWindow, days: DayRange): ChannelFlow[] {
+  const rows = new Map<Channel, ChannelFlow>(CHANNELS.map((m) => [m, { method: m, salesInCents: 0, depositsInCents: 0, refundsOutCents: 0, expensesOutCents: 0, netCents: 0 }]));
+  for (const p of b.payments) {
+    if (!inWindow(p.paidAt, w)) continue;
+    const r = rows.get(asChannel(p.method))!;
+    if (p.amountCents >= 0) r.salesInCents += p.amountCents;
+    else r.refundsOutCents += -p.amountCents;
+  }
+  for (const e of b.ledger) {
+    if (!inWindow(e.occurredAt, w)) continue;
+    const r = rows.get(asChannel(e.method))!;
+    if (e.kind === 'advance') r.salesInCents += e.amountCents;
+    if (e.kind === 'received') r.depositsInCents += e.amountCents;
+    if (e.kind === 'advance_refund' || e.kind === 'refunded') r.refundsOutCents += e.amountCents;
+  }
+  for (const o of b.amenityOrders) if (o.chargeCents > 0 && o.collectedAt && !o.invoiceId && inWindow(o.collectedAt, w)) rows.get('cash')!.salesInCents += o.chargeCents;
+  for (const x of expenses) if (inDays(x.incurredOn, days)) rows.get(asChannel(x.method))!.expensesOutCents += x.amountCents;
+  for (const r of rows.values()) r.netCents = r.salesInCents + r.depositsInCents - r.refundsOutCents - r.expensesOutCents;
+  return [...rows.values()];
+}
+
+/**
+ * What should be in the till and in the bank at the end of `day`: every movement since the space started using the system, in less out.
+ * There is no opening balance, so it is what the system recorded, to be counted against the drawer and the bank statement.
+ */
+export function balancesAsOf(b: Books, expenses: ExpenseRow[], endIso: string, day: string) {
+  const flows = channelFlows(b, expenses, { start: '0000', end: endIso }, { from: '0000-01-01', to: day });
+  const net = (m: Channel) => flows.find((f) => f.method === m)!.netCents;
+  return { cashInHandCents: net('cash'), bankCents: sum(BANK_CHANNELS.map(net)), byChannel: Object.fromEntries(CHANNELS.map((m) => [m, net(m)])) as Record<Channel, number> };
+}
+
+// ---- Receivables aging per customer ---------------------------------------------------------------------------------------------
+
+export interface MemberAging {
+  memberId: string;
+  /** Not yet due. */
+  currentCents: number;
+  /** 0 to 30 days past due. */
+  days1to30Cents: number;
+  days31to60Cents: number;
+  days61plusCents: number;
+  totalCents: number;
+  oldestDue: string;
+}
+
+/** The aged receivables ledger: what each member owed at the end of `day`, split by how late it was. Largest balance first. */
+export function agingByMember(invoices: InvoiceRow[], payments: PaymentRow[], day: string, tz: string): MemberAging[] {
+  const by = new Map<string, MemberAging>();
+  for (const { i, owed } of owedAsOf(invoices, payments, day, tz)) {
+    const row = by.get(i.memberId) ?? { memberId: i.memberId, currentCents: 0, days1to30Cents: 0, days31to60Cents: 0, days61plusCents: 0, totalCents: 0, oldestDue: i.dueDate };
+    const late = daysBetween(i.dueDate, day);
+    if (late <= 0) row.currentCents += owed;
+    else if (late <= 30) row.days1to30Cents += owed;
+    else if (late <= 60) row.days31to60Cents += owed;
+    else row.days61plusCents += owed;
+    row.totalCents += owed;
+    if (i.dueDate < row.oldestDue) row.oldestDue = i.dueDate;
+    by.set(i.memberId, row);
+  }
+  return [...by.values()].sort((a, b) => b.totalCents - a.totalCents);
 }

@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { and, desc, eq, gte, lte } from 'drizzle-orm';
 import { z } from 'zod';
 import type { Db } from '../db/client.js';
-import { EXPENSE_CATEGORIES, expenses } from '../db/schema.js';
+import { EXPENSE_CATEGORIES, PAYMENT_METHODS, expenses } from '../db/schema.js';
 import { loadLocation, requireLocationId } from '../lib/access.js';
 import { assertLocation, assertSees } from '../lib/auth.js';
 import { badRequest, notFound } from '../lib/errors.js';
@@ -18,6 +18,9 @@ const fields = z.object({
   description: z.string().trim().max(300),
   amountCents: positiveMoney,
   incurredOn: z.string().refine(isValidDate, 'Use YYYY-MM-DD'),
+  /** How it was paid. Cash comes out of the till, the rest out of the bank. Cash if not given. */
+  method: z.enum(PAYMENT_METHODS),
+  reference: z.string().trim().max(100),
 });
 
 /** Mounted behind the expenses permission. */
@@ -49,7 +52,7 @@ export function expensesRouter(db: Db) {
 
   r.post('/', async (req, res) => {
     const body = parse(
-      fields.partial({ vendor: true, description: true, incurredOn: true }).extend({ locationId: z.string() }),
+      fields.partial({ vendor: true, description: true, incurredOn: true, method: true, reference: true }).extend({ locationId: z.string() }),
       req.body,
     );
     assertLocation(req.user!, body.locationId);

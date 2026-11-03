@@ -23,6 +23,8 @@ export interface OrgContext {
   periodEnd: string;
   /** The subscription period has run out. Shown as a warning; only suspension blocks access. */
   expired: boolean;
+  /** Set when the business has a logo; changes with it, so the screens know when to fetch it again. */
+  logoVersion: string | null;
 }
 
 export interface AuthUser {
@@ -77,6 +79,7 @@ function orgContext(row: { org: typeof organizations.$inferSelect; pkg: typeof p
     maxFloors: row.pkg.maxFloors,
     maxMembers: row.pkg.maxMembers,
     periodEnd: row.org.periodEnd,
+    logoVersion: row.org.logoVersion ?? null,
     expired:
       (row.org.status === 'trial' || row.org.status === 'active') &&
       row.org.periodEnd < todayIn(config.platformTimezone),

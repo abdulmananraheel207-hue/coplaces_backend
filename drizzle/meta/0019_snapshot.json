@@ -2,7 +2,7 @@
   "version": "6",
   "dialect": "sqlite",
   "id": "2039b52b-a18d-48c8-be4d-82f10c6f1b3b",
-  "prevId": "411010b6-03c1-487a-9ede-9fc55515fecb",
+  "prevId": "4c25eb73-badb-482d-a7ac-d81c08c0224f",
   "tables": {
     "amenities": {
       "name": "amenities",

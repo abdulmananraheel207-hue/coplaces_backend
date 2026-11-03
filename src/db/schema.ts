@@ -60,7 +60,13 @@ export const BOOKING_STATUSES = ['confirmed', 'completed', 'cancelled', 'no_show
 export const VISITOR_STATUSES = ['expected', 'checked_in', 'checked_out', 'cancelled'] as const;
 export const INVOICE_STATUSES = ['open', 'paid', 'void'] as const;
 export const INVOICE_KINDS = ['subscription', 'manual'] as const;
-export const PAYMENT_METHODS = ['cash', 'card', 'bank_transfer', 'jazzcash', 'easypaisa', 'cheque', 'other'] as const;
+/** How money moved. `bank_transfer` is shown as "Online transfer" (it covers bank and mobile-wallet transfers). */
+export const PAYMENT_METHODS = ['cash', 'card', 'bank_transfer', 'cheque'] as const;
+/**
+ * Whether money that came in has actually arrived. Everything is `cleared` at once except a cheque, which is `pending` until the bank
+ * clears it (then it counts, on the day it cleared) or `bounced` (then it never counts).
+ */
+export const MONEY_STATUSES = ['cleared', 'pending', 'bounced'] as const;
 export const CONTRACT_STATUSES = ['draft', 'active', 'ended', 'cancelled'] as const;
 export const REQUEST_STATUSES = ['pending', 'approved', 'rejected', 'cancelled', 'taken'] as const;
 export const BOOKING_SOURCES = ['manual', 'plan'] as const;
@@ -90,6 +96,8 @@ export const AUDIT_ACTIONS = [
   'credit.add',
   'amenities.collect',
   'platform_payment.record',
+  'cheque.clear',
+  'cheque.bounce',
 ] as const;
 export const EXPENSE_CATEGORIES = [
   'rent',
@@ -143,7 +151,21 @@ export const organizations = sqliteTable('organizations', {
     .references(() => packages.id),
   periodEnd: text('period_end').notNull(), // subscription (or trial) paid up to, 'YYYY-MM-DD'
   notes: text('notes').notNull().default(''),
+  /**
+   * Changes whenever the logo does (null: no logo). The image itself is in `organization_logos`, so the sign-in check, which reads
+   * this row on every request, never carries it.
+   */
+  logoVersion: text('logo_version'),
   createdAt: createdAt(),
+});
+
+/** The business's logo, shown on invoices, agreements and contracts: a small image kept as a data URL (resized in the browser first). */
+export const organizationLogos = sqliteTable('organization_logos', {
+  organizationId: text('organization_id')
+    .primaryKey()
+    .references(() => organizations.id),
+  dataUrl: text('data_url').notNull(),
+  updatedAt: text('updated_at').notNull(),
 });
 
 export const locations = sqliteTable(
@@ -683,6 +705,11 @@ export const payments = sqliteTable(
     reversesPaymentId: text('reverses_payment_id'),
     reversedAt: text('reversed_at'),
     reversedById: text('reversed_by_id'),
+    /** A cheque is `pending` until it clears: only cleared payments count towards the invoice and the books. */
+    status: text('status', { enum: MONEY_STATUSES }).notNull().default('cleared'),
+    /** When a cheque cleared; the books count it on this day. */
+    clearedAt: text('cleared_at'),
+    bouncedAt: text('bounced_at'),
     createdAt: createdAt(),
   },
   (t) => [index('payments_location_idx').on(t.locationId, t.paidAt), index('payments_invoice_idx').on(t.invoiceId)],
@@ -700,6 +727,9 @@ export const expenses = sqliteTable(
     description: text('description').notNull().default(''),
     amountCents: integer('amount_cents').notNull(),
     incurredOn: text('incurred_on').notNull(),
+    /** How it was paid: cash comes out of cash in hand, the rest out of the bank. */
+    method: text('method', { enum: PAYMENT_METHODS }).notNull().default('cash'),
+    reference: text('reference').notNull().default(''),
     createdById: text('created_by_id')
       .notNull()
       .references(() => users.id),
@@ -844,6 +874,10 @@ export const depositEntries = sqliteTable(
     recordedById: text('recorded_by_id')
       .notNull()
       .references(() => users.id),
+    /** An advance or deposit paid by cheque is `pending` until it clears, and only then counts (see MONEY_STATUSES). */
+    status: text('status', { enum: MONEY_STATUSES }).notNull().default('cleared'),
+    clearedAt: text('cleared_at'),
+    bouncedAt: text('bounced_at'),
     createdAt: createdAt(),
   },
   (t) => [index('deposit_entries_location_idx').on(t.locationId, t.occurredAt), index('deposit_entries_contract_idx').on(t.contractId), index('deposit_entries_member_idx').on(t.memberId)],

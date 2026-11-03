@@ -23,6 +23,7 @@ import { overstayers } from './checkin.js';
 import { loadLocation } from '../lib/access.js';
 import * as core from './financeCore.js';
 import { loadBooks, unappliedOf } from './financeBooks.js';
+import { churn, expensesUpTo, pendingCheques, renewals } from './financeDesk.js';
 import { addDays, addMonths, daysBetween, dayRange, localDate, monthRange, todayIn, zonedToUtc } from '../lib/time.js';
 
 const count = sql<number>`count(*)`;
@@ -180,7 +181,7 @@ export async function financeReport(db: Db, p: { locationId: string; from: strin
   const prevTo = addDays(p.from, -1);
   const prevFrom = addDays(p.from, -span);
   // Every read at once: on Turso each is a round trip.
-  const [books, spend, prevExpenseRow, depositMoves, amenity, unapplied] = await Promise.all([
+  const [books, spend, prevExpenseRow, depositMoves, amenity, unapplied, spendAll, waiting, renewing, churned] = await Promise.all([
     loadBooks(db, p.locationId),
     db
       .select({ amountCents: expenses.amountCents, category: expenses.category, incurredOn: expenses.incurredOn })
@@ -204,6 +205,10 @@ export async function financeReport(db: Db, p: { locationId: string; from: strin
       .all(),
     amenityFinance(db, p.locationId, w.start, w.end),
     unappliedOf(db, p.locationId),
+    expensesUpTo(db, p.locationId, p.to),
+    pendingCheques(db, p.locationId),
+    renewals(db, p.locationId, now),
+    churn(db, p.locationId, p.from, p.to, now),
   ]);
   const months = monthsOf(p.from, p.to);
   const monthOf = (iso: string) => localDate(iso, tz).slice(0, 7);
@@ -256,7 +261,41 @@ export async function financeReport(db: Db, p: { locationId: string; from: strin
   const prevExpenses = prevExpenseRow!.v;
 
   // Deposits: what moved in the range, and what is held at its end.
-  const moved = (kind: string) => total(depositMoves.filter((x) => x.e.kind === kind).map((x) => x.e.amountCents));
+  // Only money that arrived: a deposit or advance cheque counts once it clears, on the day it cleared.
+  const moved = (kind: string) => total(books.ledger.filter((e) => e.kind === kind && e.occurredAt >= w.start && e.occurredAt < w.end).map((e) => e.amountCents));
+
+  // How money moved, by channel, in the range; and the share of what was sold that came through each.
+  const flows = core.channelFlows(books, spendAll, w, { from: p.from, to: p.to });
+  const salesIn = flows.reduce((s, f) => s + f.salesInCents, 0);
+
+  // This calendar month at a glance, whatever range is picked: billed, collected, still owed on this month's bills, overdue now.
+  const today = todayIn(tz, now);
+  const thisMonth = monthRange(today.slice(0, 7), tz);
+  const monthDays = { from: thisMonth.firstDay, to: addDays(thisMonth.nextFirstDay, -1) };
+  const monthW = { start: thisMonth.start, end: thisMonth.end };
+  const monthStatus = core.invoicesByStatus(books.invoices, monthDays, today);
+  const monthBilled = core.billedCents(books.invoices, books.lines, monthDays);
+  const monthOwed = monthStatus.open.owedCents;
+  const monthAtAGlance = {
+    month: today.slice(0, 7),
+    invoicedCents: monthBilled,
+    invoiceCount: monthStatus.open.count + monthStatus.paid.count,
+    collectedCents: core.collectedCents(books, monthW),
+    /** Of this month's bills: how much was paid and how much is still to pay (an advance counts as paid). */
+    paidOnMonthInvoicesCents: Math.max(0, monthBilled - monthOwed),
+    owedOnMonthInvoicesCents: monthOwed,
+    overdueNowCents: core.overdueCents(books.invoices, today),
+    overdueNowCount: books.invoices.filter((i) => i.status === 'open' && i.dueDate < today).length,
+    outstandingNowCents: core.outstandingCents(books.invoices),
+    collectionRatePct: monthBilled > 0 ? Math.round(((monthBilled - monthOwed) / monthBilled) * 1000) / 10 : null,
+    pendingChequesCents: waiting.amountCents,
+  };
+
+  // The aged receivables ledger at the end of the range, with names.
+  const aged = core.agingByMember(books.invoices, books.payments, p.to, tz);
+  const agedNames = aged.length
+    ? await db.select({ id: members.id, name: users.name, company: members.company }).from(members).innerJoin(users, eq(users.id, members.userId)).where(inArray(members.id, aged.map((a) => a.memberId))).all()
+    : [];
 
   const byCategory = (key: core.IncomeCategory) => total(income.filter((e) => e.category === key).map((e) => e.amountCents));
 
@@ -304,10 +343,22 @@ export async function financeReport(db: Db, p: { locationId: string; from: strin
         method: e.method,
         reference: e.reference,
         occurredAt: e.occurredAt,
+        status: e.status,
+        clearedAt: e.clearedAt,
         memberName,
         resourceName,
       })),
     },
+    currentMonth: monthAtAGlance,
+    agingByMember: aged.map((a) => ({ ...a, name: agedNames.find((n) => n.id === a.memberId)?.name ?? '', company: agedNames.find((n) => n.id === a.memberId)?.company ?? '' })),
+    channels: {
+      flows: flows.map((f) => ({ ...f, sharePct: salesIn > 0 ? Math.round((f.salesInCents / salesIn) * 1000) / 10 : 0 })),
+      salesInCents: salesIn,
+      ...core.balancesAsOf(books, spendAll, w.end, p.to),
+      pendingCheques: waiting,
+    },
+    renewals: renewing,
+    churn: churned,
   };
 }
 

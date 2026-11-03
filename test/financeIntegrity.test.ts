@@ -121,7 +121,7 @@ describe('the finances, from the first invoice to the last expense', () => {
     await checkBooks(ctx, owner, 'paid in full');
     await owner.delete(`/api/payments/${first.payment.id}`).expect(200);
     await checkBooks(ctx, owner, 'a payment taken back');
-    await owner.post(`/api/invoices/${aliaInvoice.id}/payments`).send({ amountCents: 200_000, method: 'jazzcash' }).expect(201);
+    await owner.post(`/api/invoices/${aliaInvoice.id}/payments`).send({ amountCents: 200_000, method: 'bank_transfer' }).expect(201);
     await checkBooks(ctx, owner, 'paid again');
 
     // 3. A hand-made invoice with several lines, and one that is voided.

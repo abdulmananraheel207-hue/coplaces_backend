@@ -132,7 +132,7 @@ export async function seedDemo(db: Db, now = new Date()) {
           organizationId: org.id,
           packageId: pkg.id,
           amountCents: pkg.priceCents,
-          method: pick(['bank_transfer', 'jazzcash', 'easypaisa', 'bank_transfer']),
+          method: pick(['bank_transfer', 'card', 'cash', 'bank_transfer']),
           reference: `TXN-${between(100000, 999999)}`,
           periodStart,
           periodEnd,
@@ -663,7 +663,7 @@ export async function seedDemo(db: Db, now = new Date()) {
         await recordPayment(db, {
           invoiceId: inv.id,
           amountCents: inv.totalCents,
-          method: pick(['bank_transfer', 'jazzcash', 'easypaisa', 'cash']),
+          method: pick(['bank_transfer', 'card', 'cash', 'cash']),
           paidAt: zonedToUtc(addDays(inv.issueDate, between(1, 6)), '11:00', 'Asia/Karachi').toISOString(),
           reference: '',
           notes: '',

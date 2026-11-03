@@ -30,6 +30,8 @@ import { assetsRouter, issuesRouter, tasksRouter } from './routes/operations.js'
 import { shiftsRouter } from './routes/shifts.js';
 import { membersRouter } from './routes/members.js';
 import { paymentsRouter } from './routes/payments.js';
+import { chequesRouter } from './routes/cheques.js';
+import { brandingRouter } from './routes/branding.js';
 import { platformRouter } from './routes/platform.js';
 import { plansRouter } from './routes/plans.js';
 import { reportsRouter } from './routes/reports.js';
@@ -80,6 +82,8 @@ export function createApp(db: Db, opts: { webDist?: string } = {}) {
   );
   // Attendance devices speak plain text, before the JSON parser, and cannot sign in.
   app.use('/iclock', iclockRouter(db));
+  // The logo upload is the one body bigger than the rest: a small image as a data URL.
+  app.use('/api/branding/logo', express.json({ limit: '512kb' }));
   app.use(express.json({ limit: '100kb' }));
   app.use(cookieParser());
 
@@ -130,10 +134,12 @@ export function createApp(db: Db, opts: { webDist?: string } = {}) {
   api.use('/visitors', requireFeature('visitors'), visitorsRouter(db));
   api.use('/invoices', requireFeature('invoicing'), invoicesRouter(db));
   api.use('/payments', requireFeature('invoicing'), paymentsRouter(db));
+  api.use('/cheques', requireFeature('invoicing'), chequesRouter(db));
   api.use('/expenses', requireFeature('expenses'), requirePermission('expenses'), expensesRouter(db));
   api.use('/reports', reportsRouter(db));
   api.use('/audit', auditRouter(db));
   api.use('/me', meRouter(db));
+  api.use('/branding', brandingRouter(db));
   api.use((_req, _res, next) => next(new HttpError(404, 'Not found')));
   app.use('/api', api);
 
